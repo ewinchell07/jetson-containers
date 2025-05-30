@@ -19,6 +19,8 @@ import argparse
 from typing import Optional, Dict, List, Any, Tuple
 from dataclasses import dataclass
 from pathlib import Path
+from pyannote.audio import Pipeline
+from pyannote.core import Segment, Timeline
 
 # Suppress all deprecation warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -44,6 +46,14 @@ class TranscriptionConfig:
     no_speech_threshold: float = 0.6
     logprob_threshold: float = -1.0
     compression_ratio_threshold: float = 2.4
+
+@dataclass
+class DiarizationConfig:
+    """Configuration for speaker diarization"""
+    use_auth_token: str = "hf_xxx"  # Replace with your HuggingFace token
+    num_speakers: Optional[int] = None
+    min_speakers: int = 1
+    max_speakers: int = 5
 
 class AudioLogger:
     """Handles logging configuration and setup"""
@@ -517,7 +527,8 @@ class AudioRecorder:
         self.input_device = 0
         logging.info(f"\nUsing input device: {sd.query_devices(self.input_device)['name']}")
 
-    def audio_callback(self, indata, frames, time, status):
+    def audio_callback(self, indata, frames, time_info, status):
+        """Callback for audio recording"""
         if status:
             current_time = time.time()
             if status.input_overflow:
@@ -536,13 +547,19 @@ class AudioRecorder:
             self.audio_queue.put(indata.copy())
 
     def save_audio_chunk(self, audio_data: np.ndarray, filename: str):
-        with wave.open(filename, 'wb') as wf:
-            wf.setnchannels(self.config.channels)
-            wf.setsampwidth(2)  # 2 bytes for int16
-            wf.setframerate(self.config.sample_rate)
-            wf.writeframes(audio_data.tobytes())
+        """Save audio chunk to file"""
+        try:
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(self.config.channels)
+                wf.setsampwidth(2)  # 2 bytes for int16
+                wf.setframerate(self.config.sample_rate)
+                wf.writeframes(audio_data.tobytes())
+        except Exception as e:
+            logging.error(f"Error saving audio chunk: {str(e)}")
+            raise
 
     def start_recording(self):
+        """Start audio recording"""
         self.recording = True
         self.current_chunk = []
         self.overflow_count = 0
@@ -562,19 +579,105 @@ class AudioRecorder:
             logging.info("\nAudio stream started successfully")
         except Exception as e:
             logging.error(f"Error starting audio stream: {str(e)}")
-            return
+            raise
 
     def stop_recording(self):
+        """Stop audio recording and cleanup"""
         self.recording = False
-        if hasattr(self, 'stream'):
-            self.stream.stop()
-            self.stream.close()
-        logging.info("Recording stopped.")
+        try:
+            if hasattr(self, 'stream'):
+                self.stream.stop()
+                self.stream.close()
+                del self.stream
+            # Clear the queue
+            while not self.audio_queue.empty():
+                try:
+                    self.audio_queue.get_nowait()
+                except queue.Empty:
+                    break
+            self.current_chunk = []
+            logging.info("Recording stopped.")
+        except Exception as e:
+            logging.error(f"Error stopping recording: {str(e)}")
+
+    def __del__(self):
+        """Cleanup when the object is destroyed"""
+        try:
+            self.stop_recording()
+        except Exception as e:
+            logging.warning(f"Error during audio recorder cleanup: {str(e)}")
+
+class DiarizationManager:
+    """Manages speaker diarization using pyannote.audio"""
+    def __init__(self, config: DiarizationConfig):
+        self.config = config
+        self.pipeline = None
+        self._initialize_pipeline()
+
+    def _initialize_pipeline(self):
+        """Initialize the pyannote.audio pipeline"""
+        try:
+            logging.info("Initializing speaker diarization pipeline...")
+            self.pipeline = Pipeline.from_pretrained(
+                "pyannote/speaker-diarization-3.1",
+                use_auth_token=self.config.use_auth_token
+            )
+            if torch.cuda.is_available():
+                self.pipeline = self.pipeline.to(torch.device("cuda"))
+            logging.info("Speaker diarization pipeline initialized successfully")
+        except Exception as e:
+            logging.error(f"Error initializing diarization pipeline: {str(e)}")
+            raise
+
+    def process_audio(self, audio_file: str) -> List[Dict[str, Any]]:
+        """Process audio file and return speaker segments
+        
+        Args:
+            audio_file: Path to the audio file
+            
+        Returns:
+            List of dictionaries containing speaker segments with start time, end time, and speaker ID
+        """
+        try:
+            logging.info(f"Processing audio file for diarization: {audio_file}")
+            diarization = self.pipeline(
+                audio_file,
+                num_speakers=self.config.num_speakers,
+                min_speakers=self.config.min_speakers,
+                max_speakers=self.config.max_speakers
+            )
+            
+            # Convert diarization results to a list of segments
+            segments = []
+            for turn, _, speaker in diarization.itertracks(yield_label=True):
+                segments.append({
+                    "start": turn.start,
+                    "end": turn.end,
+                    "speaker": speaker
+                })
+            
+            logging.info(f"Found {len(segments)} speaker segments")
+            return segments
+        except Exception as e:
+            logging.error(f"Error during diarization: {str(e)}")
+            return []
+
+    def __del__(self):
+        """Cleanup when the object is destroyed"""
+        try:
+            if self.pipeline is not None:
+                del self.pipeline
+                torch.cuda.empty_cache()
+        except Exception as e:
+            logging.warning(f"Error during diarization cleanup: {str(e)}")
 
 class TranscriptionManager:
     """Manages the transcription process"""
-    def __init__(self, model_config: TranscriptionConfig, audio_config: AudioConfig):
+    def __init__(self, model_config: TranscriptionConfig, audio_config: AudioConfig, diarization_config: Optional[DiarizationConfig] = None):
+        self.model_config = model_config
+        self.audio_config = audio_config
         self.model_manager = ModelManager(model_config)
+        self.diarization_manager = DiarizationManager(diarization_config) if diarization_config else None
         self.audio_recorder = AudioRecorder(audio_config)
         self.process_thread = None
         self.chunk_queue = queue.Queue()
@@ -645,47 +748,35 @@ class TranscriptionManager:
                 continue
 
     def _transcribe_and_save(self, audio_file: Path, timestamp: str):
+        """Transcribe audio file and save results with speaker diarization if enabled"""
         try:
-            # Validate audio file
-            audio_data, _ = AudioValidator.validate_audio_file(str(audio_file))
+            # Get transcription
+            audio_data, samplerate = AudioValidator.validate_audio_file(str(audio_file))
+            audio_tensor = torch.from_numpy(audio_data).float()
+            result = self.model_manager.transcribe(audio_tensor)
             
-            # Convert to tensor and validate
-            try:
-                audio_tensor = torch.from_numpy(audio_data).float().to(self.model_manager.device)
-                if torch.isnan(audio_tensor).any() or torch.isinf(audio_tensor).any():
-                    raise ValueError("Audio tensor contains NaN or Inf values")
-            except Exception as e:
-                logging.error(f"Error converting audio to tensor: {str(e)}")
-                return
+            # Get diarization if enabled
+            diarization_segments = []
+            if self.diarization_manager:
+                diarization_segments = self.diarization_manager.process_audio(str(audio_file))
             
-            # Transcribe with retry
-            max_retries = 2
-            for attempt in range(max_retries):
-                try:
-                    result = self.model_manager.transcribe(audio_tensor)
-                    break
-                except Exception as e:
-                    if attempt == max_retries - 1:
-                        logging.error(f"Failed to transcribe after {max_retries} attempts: {str(e)}")
-                        return
-                    logging.warning(f"Transcription attempt {attempt + 1} failed, retrying...")
-                    time.sleep(1)  # Wait before retry
+            # Combine transcription with diarization
+            output = {
+                "timestamp": timestamp,
+                "audio_file": str(audio_file),
+                "transcription": result,
+                "diarization": diarization_segments
+            }
             
-            if result and result.get('text'):
-                transcript_file = self.audio_recorder.recordings_dir / f"transcript_{timestamp}.json"
-                with open(transcript_file, 'w') as f:
-                    json.dump(result, f, indent=2)
-                logging.info(f"Transcription saved to {transcript_file}")
-                
-                logging.info("\nTranscription:")
-                for segment in result["segments"]:
-                    text = segment["text"]
-                    logging.info(f"{text}")
-            else:
-                logging.warning("No transcription generated for this chunk")
-                
+            # Save results
+            output_file = audio_file.parent / f"transcript_{timestamp}.json"
+            with open(output_file, 'w') as f:
+                json.dump(output, f, indent=2)
+            
+            logging.info(f"Saved transcription and diarization to {output_file}")
+            
         except Exception as e:
-            logging.error(f"Error transcribing {audio_file}: {str(e)}")
+            logging.error(f"Error in transcription and diarization: {str(e)}")
 
     def start_continuous_transcription(self):
         """Start recording and processing audio chunks"""
@@ -706,25 +797,48 @@ class TranscriptionManager:
         """Stop recording and wait for all chunks to be processed"""
         logging.info("Stopping recording...")
         self._running = False
-        self.audio_recorder.stop_recording()
+        
+        # Stop the audio recorder first
+        if self.audio_recorder:
+            self.audio_recorder.stop_recording()
         
         # Wait for the collection thread to finish
-        if self.process_thread:
-            self.process_thread.join()
+        if self.process_thread and self.process_thread.is_alive():
+            self.process_thread.join(timeout=5.0)
         
         # Wait for all chunks to be processed
-        if self.processing_thread:
-            self.processing_thread.join()
+        if self.processing_thread and self.processing_thread.is_alive():
+            self.processing_thread.join(timeout=5.0)
         
-        # Clean up
+        # Clear the chunk queue
+        while not self.chunk_queue.empty():
+            try:
+                self.chunk_queue.get_nowait()
+            except queue.Empty:
+                break
+        
+        # Clean up resources
         try:
             if self.model_manager:
                 del self.model_manager
+            if self.diarization_manager:
+                del self.diarization_manager
+            if self.audio_recorder:
+                del self.audio_recorder
             GPUManager.cleanup_memory()
+            torch.cuda.empty_cache()
+            gc.collect()
         except Exception as e:
             logging.error(f"Error during cleanup: {str(e)}")
         
         logging.info("Transcription stopped.")
+
+    def __del__(self):
+        """Cleanup when the object is destroyed"""
+        try:
+            self.stop_continuous_transcription()
+        except Exception as e:
+            logging.warning(f"Error during transcription manager cleanup: {str(e)}")
 
 def main():
     parser = argparse.ArgumentParser(description='Whisper Transcription Tool')
@@ -735,9 +849,11 @@ def main():
     parser.add_argument('--audio_file', help='Path to audio file (required for file mode)')
     parser.add_argument('--chunk_duration', type=int, default=600,
                       help='Duration of audio chunks in seconds for continuous mode (default: 600)')
-    
+    parser.add_argument('--language', default='en', help='Language for transcription')
+    parser.add_argument('--hf_token', help='HuggingFace token for speaker diarization')
+    parser.add_argument('--num_speakers', type=int, help='Number of speakers (optional)')
     args = parser.parse_args()
-    
+
     # Initialize logging
     AudioLogger()
     
@@ -750,7 +866,10 @@ def main():
             return
             
         try:
-            model_config = TranscriptionConfig(model_name=args.model)
+            model_config = TranscriptionConfig(
+                model_name=args.model,
+                language=args.language
+            )
             model_manager = ModelManager(model_config)
             
             audio_data, _ = AudioValidator.validate_audio_file(args.audio_file)
@@ -758,9 +877,26 @@ def main():
             
             result = model_manager.transcribe(audio_tensor)
             
+            # Get diarization if enabled
+            diarization_segments = []
+            if args.hf_token:
+                diarization_config = DiarizationConfig(
+                    use_auth_token=args.hf_token,
+                    num_speakers=args.num_speakers
+                )
+                diarization_manager = DiarizationManager(diarization_config)
+                diarization_segments = diarization_manager.process_audio(args.audio_file)
+            
+            # Combine transcription with diarization
+            output = {
+                "audio_file": args.audio_file,
+                "transcription": result,
+                "diarization": diarization_segments
+            }
+            
             output_file = os.path.splitext(args.audio_file)[0] + "_transcript.json"
             with open(output_file, 'w') as f:
-                json.dump(result, f, indent=2)
+                json.dump(output, f, indent=2)
             logging.info(f"\nTranscription saved to {output_file}")
             
             logging.info("\nTranscription:")
@@ -773,10 +909,20 @@ def main():
             return
     else:  # continuous mode
         try:
-            model_config = TranscriptionConfig(model_name=args.model)
+            model_config = TranscriptionConfig(
+                model_name=args.model,
+                language=args.language
+            )
             audio_config = AudioConfig(chunk_duration=args.chunk_duration)
             
-            transcription_manager = TranscriptionManager(model_config, audio_config)
+            diarization_config = None
+            if args.hf_token:
+                diarization_config = DiarizationConfig(
+                    use_auth_token=args.hf_token,
+                    num_speakers=args.num_speakers
+                )
+            
+            transcription_manager = TranscriptionManager(model_config, audio_config, diarization_config)
             transcription_manager.start_continuous_transcription()
             
             while True:
