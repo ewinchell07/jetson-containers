@@ -18,3 +18,6 @@ nv_tegra_release
 kokoro-*-*.wav
 audio.wav
 benchmark.csv
+# Recordings
+packages/speech/whisper_trt/recordings/
+packages/speech/whisperx/recordings/
