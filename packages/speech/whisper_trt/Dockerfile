@@ -4,24 +4,38 @@
 # depends: [pytorch, torch2trt, onnxruntime]
 # requires: '>=36'
 # test: test.py
-# notes: TensorRT optimized Whisper ASR from https://github.com/NVIDIA-AI-IOT/whisper_trt
+# notes: TensorRT optimized Whisper ASR with real-time audio processing
 #---
-ARG BASE_IMAGE
-FROM ${BASE_IMAGE}
+FROM dustynv/whisper_trt:r36.3.0
 
-ADD https://api.github.com/repos/NVIDIA-AI-IOT/whisper_trt/git/refs/heads/main /tmp/whisper_trt_version.json
-
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends \
-		  ffmpeg \
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    portaudio19-dev \
+    python3-pip \
+    ffmpeg \
+    libsndfile1 \
+    libsndfile1-dev \
+    libasound2-dev \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
-    
-RUN pip3 install openai-whisper && \
-    git clone https://github.com/NVIDIA-AI-IOT/whisper_trt /opt/whisper_trt && \
-    cd /opt/whisper_trt && \
-    pip3 install -e . && \
-    mkdir -p ~/.cache && \
-    ln -s /data/models/whisper ~/.cache/whisper && \
-    ln -s /data/models/whisper ~/.cache/whisper_trt 
+
+# Set working directory
+WORKDIR /opt/whisper_trt
+
+# Copy requirements first for better caching
+COPY requirements.txt .
+
+# Install Python dependencies
+RUN pip3 install --no-cache-dir -r requirements.txt
+
+# Copy the application code
+COPY . .
+
+# Set environment variables
+ENV PYTHONPATH=/opt/whisper_trt
+ENV CUDA_VISIBLE_DEVICES=0
+ENV TF_FORCE_GPU_ALLOW_GROWTH=true
+
+# Command to run the container
+CMD ["bash"]
 

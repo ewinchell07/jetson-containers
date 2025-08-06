@@ -33,19 +33,36 @@ class AudioConfig:
     channels: int = 1
     dtype: type = np.int16
     chunk_duration: int = 600  # 10 minutes in seconds
-    blocksize: int = 2048
-    latency: str = 'high'
+    blocksize: int = 1024  # Reduced from 2048 to handle data faster
+    latency: str = 'low'  # Changed from 'high' to 'low' for better real-time performance
 
 @dataclass
 class TranscriptionConfig:
-    """Configuration for transcription"""
-    model_name: str = "tiny.en"
-    language: str = "en"
-    task: str = "transcribe"
-    temperature: float = 0.0
-    no_speech_threshold: float = 0.6
-    logprob_threshold: float = -1.0
-    compression_ratio_threshold: float = 2.4
+    """Configuration for transcription
+    
+    Parameters that affect transcription sensitivity and accuracy:
+    - temperature: Controls randomness in sampling (0.0 = deterministic, higher = more random)
+    - no_speech_threshold: Threshold for considering a segment as silence (higher = more aggressive silence detection)
+    - logprob_threshold: Minimum log probability for a token to be considered valid (lower = more lenient)
+    - compression_ratio_threshold: Maximum compression ratio for a segment (higher = more aggressive compression)
+    - condition_on_previous_text: Whether to condition on previous text (True = more context-aware)
+    - initial_prompt: Optional initial prompt to guide transcription
+    - word_timestamps: Whether to include word-level timestamps
+    - prepend_punctuations: Punctuations to prepend to next word
+    - append_punctuations: Punctuations to append to previous word
+    """
+    model_name: str = "base.en"  # Using base.en for better accuracy while maintaining reasonable speed
+    language: str = "en"  # Language code
+    task: str = "transcribe"  # Task: transcribe or translate
+    temperature: float = 0.0  # Keep deterministic for consistency
+    no_speech_threshold: float = 0.3  # Lower threshold to catch quiet speech
+    logprob_threshold: float = -0.7  # More lenient token acceptance
+    compression_ratio_threshold: float = 1.8  # Less aggressive compression
+    condition_on_previous_text: bool = True  # Use context for better accuracy
+    initial_prompt: Optional[str] = "This is a conversation between parents and children in a home environment. Sometimes there is a TV playing in the background, you can ignore transcribing that."  # Context prompt
+    word_timestamps: bool = True  # Include word-level timestamps
+    prepend_punctuations: str = '"\'¿([{-'  # Punctuations to prepend
+    append_punctuations: str = '"\'.,!?;:")]}、'  # Punctuations to append
 
 @dataclass
 class DiarizationConfig:
@@ -74,6 +91,7 @@ class AudioLogger:
 class GPUManager:
     """Manages GPU resources and memory"""
     _initialized = False
+    _memory_threshold = 0.8  # 80% memory threshold
 
     @staticmethod
     def initialize_cuda():
@@ -102,8 +120,8 @@ class GPUManager:
             logging.info(f"CUDA Capability: {props.major}.{props.minor}")
             logging.info(f"Total Memory: {props.total_memory / 1024**3:.2f} GB")
             
-            # Set conservative memory settings
-            torch.cuda.set_per_process_memory_fraction(0.6)  # Even more conservative
+            # Set more conservative memory settings
+            torch.cuda.set_per_process_memory_fraction(0.4)  # Reduced from 0.6 to 0.4
             
             # Configure cuDNN
             torch.backends.cudnn.enabled = True
@@ -215,6 +233,26 @@ class GPUManager:
         except Exception as e:
             logging.error(f"Error checking CUDA compatibility: {str(e)}")
             logging.warning("Falling back to CPU mode")
+
+    @staticmethod
+    def check_memory_usage():
+        """Check if memory usage is above threshold"""
+        try:
+            if not torch.cuda.is_available():
+                return False
+                
+            device = torch.cuda.current_device()
+            total_memory = torch.cuda.get_device_properties(device).total_memory
+            allocated_memory = torch.cuda.memory_allocated(device)
+            
+            memory_usage = allocated_memory / total_memory
+            if memory_usage > GPUManager._memory_threshold:
+                logging.warning(f"High memory usage detected: {memory_usage:.2%}")
+                return True
+            return False
+        except Exception as e:
+            logging.warning(f"Error checking memory usage: {str(e)}")
+            return False
 
 class AudioValidator:
     """Handles audio file validation and preprocessing"""
@@ -512,23 +550,39 @@ class AudioRecorder:
     def __init__(self, config: AudioConfig):
         self.config = config
         self.recording = False
-        self.audio_queue = queue.Queue()
+        self.audio_queue = queue.Queue(maxsize=100)  # Reduced maxsize to prevent memory buildup
         self.current_chunk = []
         self.overflow_count = 0
         self.last_overflow_time = time.time()
         self.recordings_dir = Path("recordings")
         self.recordings_dir.mkdir(exist_ok=True)
+        self.chunk_size = 0
+        self.max_chunk_size = self.config.chunk_duration * self.config.sample_rate
         
         self._setup_audio_device()
 
     def _setup_audio_device(self):
+        """Setup audio device with optimized settings"""
         logging.info("\nAvailable audio devices:")
         logging.info(sd.query_devices())
+        
+        # Try to find the best input device
+        devices = sd.query_devices()
         self.input_device = 0
-        logging.info(f"\nUsing input device: {sd.query_devices(self.input_device)['name']}")
+        
+        # Look for a device with good buffer settings
+        for i, device in enumerate(devices):
+            if device['max_input_channels'] > 0:  # It's an input device
+                if device.get('default_samplerate', 0) >= self.config.sample_rate:
+                    self.input_device = i
+                    break
+        
+        device_info = sd.query_devices(self.input_device)
+        logging.info(f"\nUsing input device: {device_info['name']}")
+        logging.info(f"Device settings: {device_info}")
 
     def audio_callback(self, indata, frames, time_info, status):
-        """Callback for audio recording"""
+        """Callback for audio recording with improved overflow handling"""
         if status:
             current_time = time.time()
             if status.input_overflow:
@@ -536,15 +590,56 @@ class AudioRecorder:
                 if current_time - self.last_overflow_time > 5:
                     logging.warning(f"Input buffer overflow detected. This may cause audio loss. (Overflow count: {self.overflow_count})")
                     self.last_overflow_time = current_time
+                    
+                    # More aggressive queue clearing on overflow
+                    if self.audio_queue.qsize() > 50:  # Reduced threshold
+                        try:
+                            # Clear more data to prevent overflow
+                            for _ in range(min(50, self.audio_queue.qsize())):
+                                self.audio_queue.get_nowait()
+                            logging.info("Cleared audio queue to prevent overflow")
+                        except queue.Empty:
+                            pass
             else:
                 logging.warning(f"Status: {status}")
                 
         if self.recording:
-            if self.audio_queue.qsize() > 100:
-                logging.warning(f"Audio queue is getting large ({self.audio_queue.qsize()} chunks). Processing may be falling behind.")
-            
-            self.current_chunk.extend(indata.copy())
-            self.audio_queue.put(indata.copy())
+            try:
+                # Check queue size and warn if getting too large
+                if self.audio_queue.qsize() > 50:  # Reduced threshold
+                    logging.warning(f"Audio queue is getting large ({self.audio_queue.qsize()} chunks). Processing may be falling behind.")
+                    # Clear some data to prevent memory buildup
+                    try:
+                        for _ in range(min(25, self.audio_queue.qsize())):
+                            self.audio_queue.get_nowait()
+                    except queue.Empty:
+                        pass
+                
+                # Add data to current chunk
+                self.current_chunk.extend(indata)
+                self.chunk_size += len(indata)
+                
+                # If we've reached the chunk size, add to queue and reset
+                if self.chunk_size >= self.max_chunk_size:
+                    try:
+                        # Convert to numpy array and copy once
+                        audio_data = np.array(self.current_chunk, dtype=self.config.dtype)
+                        # Use non-blocking put with timeout
+                        self.audio_queue.put(audio_data, timeout=0.1)
+                        # Reset chunk
+                        self.current_chunk = []
+                        self.chunk_size = 0
+                    except queue.Full:
+                        logging.warning("Audio queue is full, dropping chunk")
+                        # Reset chunk even if queue is full
+                        self.current_chunk = []
+                        self.chunk_size = 0
+                    
+            except Exception as e:
+                logging.error(f"Error in audio callback: {str(e)}")
+                # Reset chunk on error
+                self.current_chunk = []
+                self.chunk_size = 0
 
     def save_audio_chunk(self, audio_data: np.ndarray, filename: str):
         """Save audio chunk to file"""
@@ -559,9 +654,10 @@ class AudioRecorder:
             raise
 
     def start_recording(self):
-        """Start audio recording"""
+        """Start audio recording with optimized settings"""
         self.recording = True
         self.current_chunk = []
+        self.chunk_size = 0
         self.overflow_count = 0
         self.last_overflow_time = time.time()
         
@@ -577,6 +673,7 @@ class AudioRecorder:
             )
             self.stream.start()
             logging.info("\nAudio stream started successfully")
+            logging.info(f"Stream settings: blocksize={self.config.blocksize}, latency={self.config.latency}")
         except Exception as e:
             logging.error(f"Error starting audio stream: {str(e)}")
             raise
@@ -596,6 +693,7 @@ class AudioRecorder:
                 except queue.Empty:
                     break
             self.current_chunk = []
+            self.chunk_size = 0
             logging.info("Recording stopped.")
         except Exception as e:
             logging.error(f"Error stopping recording: {str(e)}")
@@ -673,50 +771,73 @@ class DiarizationManager:
 
 class TranscriptionManager:
     """Manages the transcription process"""
-    def __init__(self, model_config: TranscriptionConfig, audio_config: AudioConfig, diarization_config: Optional[DiarizationConfig] = None):
+    def __init__(self, model_config: TranscriptionConfig, audio_config: AudioConfig, diarization_config: Optional[DiarizationConfig] = None, record_only: bool = False):
         self.model_config = model_config
         self.audio_config = audio_config
-        self.model_manager = ModelManager(model_config)
-        self.diarization_manager = DiarizationManager(diarization_config) if diarization_config else None
+        self.record_only = record_only
+        if not record_only:
+            self.model_manager = ModelManager(model_config)
+            self.diarization_manager = DiarizationManager(diarization_config) if diarization_config else None
         self.audio_recorder = AudioRecorder(audio_config)
         self.process_thread = None
-        self.chunk_queue = queue.Queue()
+        self.chunk_queue = queue.Queue(maxsize=10)  # Limit queue size
         self.processing_thread = None
         self._running = False
+        self.last_cleanup_time = time.time()
+        self.cleanup_interval = 60  # Cleanup every 60 seconds
 
     def process_audio_chunks(self):
         """Collect audio chunks and add them to the processing queue"""
         while self._running:
             try:
-                samples_per_chunk = self.audio_recorder.config.chunk_duration * self.audio_recorder.config.sample_rate
-                audio_chunk = []
-                
-                logging.info(f"\nCollecting {self.audio_recorder.config.chunk_duration} seconds of audio...")
-                while len(audio_chunk) < samples_per_chunk and self._running:
+                # Get data from audio recorder queue
+                try:
+                    audio_data = self.audio_recorder.audio_queue.get(timeout=1)
+                    
+                    # Check if we need to do periodic cleanup
+                    current_time = time.time()
+                    if current_time - self.last_cleanup_time > self.cleanup_interval:
+                        self._perform_cleanup()
+                        self.last_cleanup_time = current_time
+                    
+                    # Add to processing queue with timeout
                     try:
-                        data = self.audio_recorder.audio_queue.get(timeout=1)
-                        audio_chunk.extend(data)
-                    except queue.Empty:
-                        if not self._running:
-                            break
-                        logging.info("No audio data received in the last second")
-                        continue
-
-                if audio_chunk and self._running:
-                    audio_data = np.array(audio_chunk, dtype=self.audio_recorder.config.dtype)
+                        self.chunk_queue.put(audio_data, timeout=0.1)
+                        logging.info(f"Added new audio chunk to processing queue (size: {len(audio_data)} samples)")
+                    except queue.Full:
+                        logging.warning("Processing queue is full, dropping chunk")
+                        # Force cleanup if queue is full
+                        self._perform_cleanup()
+                        
+                except queue.Empty:
+                    if not self._running:
+                        break
+                    continue
                     
-                    if np.max(np.abs(audio_data)) < 0.01:
-                        logging.info("\nNo audio detected in this chunk, skipping...")
-                        continue
-                    
-                    # Add chunk to processing queue
-                    self.chunk_queue.put(audio_data)
-                    logging.info(f"Added new audio chunk to processing queue (size: {len(audio_data)} samples)")
             except Exception as e:
                 logging.error(f"Error in audio chunk collection: {str(e)}")
                 if not self._running:
                     break
                 continue
+
+    def _perform_cleanup(self):
+        """Perform periodic cleanup of resources"""
+        try:
+            # Clear processing queue if it's getting too large
+            while not self.chunk_queue.empty():
+                try:
+                    self.chunk_queue.get_nowait()
+                except queue.Empty:
+                    break
+            
+            # Force garbage collection
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            logging.info("Performed periodic cleanup")
+        except Exception as e:
+            logging.error(f"Error during cleanup: {str(e)}")
 
     def process_chunks(self):
         """Process audio chunks from the queue and transcribe them"""
@@ -733,11 +854,22 @@ class TranscriptionManager:
                 self.audio_recorder.save_audio_chunk(audio_data, str(audio_file))
                 logging.info(f"\nSaved audio chunk to {audio_file}")
                 
-                # Transcribe immediately
-                self._transcribe_and_save(audio_file, timestamp)
+                if not self.record_only:
+                    # Transcribe immediately
+                    self._transcribe_and_save(audio_file, timestamp)
+                    
+                    # Clean up after each chunk
+                    if os.path.exists(audio_file):
+                        os.remove(audio_file)  # Remove audio file after processing
+                else:
+                    logging.info(f"Record-only mode: Saved audio chunk {timestamp}")
                 
                 # Mark the chunk as processed
                 self.chunk_queue.task_done()
+                
+                # Clean up audio data
+                del audio_data
+                gc.collect()
                 
             except queue.Empty:
                 if not self._running:
@@ -753,7 +885,16 @@ class TranscriptionManager:
             # Get transcription
             audio_data, samplerate = AudioValidator.validate_audio_file(str(audio_file))
             audio_tensor = torch.from_numpy(audio_data).float()
+            
+            # Clear audio data after creating tensor
+            del audio_data
+            gc.collect()
+            
             result = self.model_manager.transcribe(audio_tensor)
+            
+            # Clear tensor after transcription
+            del audio_tensor
+            gc.collect()
             
             # Get diarization if enabled
             diarization_segments = []
@@ -775,12 +916,19 @@ class TranscriptionManager:
             
             logging.info(f"Saved transcription and diarization to {output_file}")
             
+            # Clean up
+            del result
+            del diarization_segments
+            del output
+            gc.collect()
+            
         except Exception as e:
             logging.error(f"Error in transcription and diarization: {str(e)}")
 
     def start_continuous_transcription(self):
         """Start recording and processing audio chunks"""
         self._running = True
+        self.last_cleanup_time = time.time()
         self.audio_recorder.start_recording()
         
         # Start the collection thread
@@ -799,31 +947,33 @@ class TranscriptionManager:
         self._running = False
         
         # Stop the audio recorder first
-        if self.audio_recorder:
+        if hasattr(self, 'audio_recorder') and self.audio_recorder:
             self.audio_recorder.stop_recording()
         
         # Wait for the collection thread to finish
-        if self.process_thread and self.process_thread.is_alive():
+        if hasattr(self, 'process_thread') and self.process_thread and self.process_thread.is_alive():
             self.process_thread.join(timeout=5.0)
         
         # Wait for all chunks to be processed
-        if self.processing_thread and self.processing_thread.is_alive():
+        if hasattr(self, 'processing_thread') and self.processing_thread and self.processing_thread.is_alive():
             self.processing_thread.join(timeout=5.0)
         
         # Clear the chunk queue
-        while not self.chunk_queue.empty():
-            try:
-                self.chunk_queue.get_nowait()
-            except queue.Empty:
-                break
+        if hasattr(self, 'chunk_queue'):
+            while not self.chunk_queue.empty():
+                try:
+                    self.chunk_queue.get_nowait()
+                except queue.Empty:
+                    break
         
         # Clean up resources
         try:
-            if self.model_manager:
-                del self.model_manager
-            if self.diarization_manager:
-                del self.diarization_manager
-            if self.audio_recorder:
+            if not self.record_only:
+                if hasattr(self, 'model_manager') and self.model_manager:
+                    del self.model_manager
+                if hasattr(self, 'diarization_manager') and self.diarization_manager:
+                    del self.diarization_manager
+            if hasattr(self, 'audio_recorder') and self.audio_recorder:
                 del self.audio_recorder
             GPUManager.cleanup_memory()
             torch.cuda.empty_cache()
@@ -831,36 +981,327 @@ class TranscriptionManager:
         except Exception as e:
             logging.error(f"Error during cleanup: {str(e)}")
         
-        logging.info("Transcription stopped.")
+        logging.info("Recording stopped.")
 
     def __del__(self):
         """Cleanup when the object is destroyed"""
         try:
-            self.stop_continuous_transcription()
+            if hasattr(self, '_running') and self._running:
+                self.stop_continuous_transcription()
         except Exception as e:
             logging.warning(f"Error during transcription manager cleanup: {str(e)}")
 
+class SimpleAudioRecorder:
+    """Simplified audio recorder for record-only mode - no queues, direct file saving"""
+    def __init__(self, config: AudioConfig):
+        self.config = config
+        self.recording = False
+        self.current_chunk = []
+        self.chunk_size = 0
+        self.max_chunk_size = self.config.chunk_duration * self.config.sample_rate
+        self.recordings_dir = Path("recordings")
+        self.recordings_dir.mkdir(exist_ok=True)
+        
+        self._setup_audio_device()
+
+    def _setup_audio_device(self):
+        """Setup audio device with optimized settings"""
+        logging.info("\nAvailable audio devices:")
+        logging.info(sd.query_devices())
+        
+        # Try to find the best input device
+        devices = sd.query_devices()
+        self.input_device = 0
+        
+        # Look for a device with good buffer settings
+        for i, device in enumerate(devices):
+            if device['max_input_channels'] > 0:  # It's an input device
+                if device.get('default_samplerate', 0) >= self.config.sample_rate:
+                    self.input_device = i
+                    break
+        
+        device_info = sd.query_devices(self.input_device)
+        logging.info(f"\nUsing input device: {device_info['name']}")
+        logging.info(f"Device settings: {device_info}")
+
+    def audio_callback(self, indata, frames, time_info, status):
+        """Callback for audio recording - direct file saving"""
+        if status:
+            if status.input_overflow:
+                logging.warning("Input buffer overflow detected. This may cause audio loss.")
+            else:
+                logging.warning(f"Status: {status}")
+                
+        if self.recording:
+            try:
+                # Add data to current chunk
+                self.current_chunk.extend(indata)
+                self.chunk_size += len(indata)
+                
+                # If we've reached the chunk size, save directly to file
+                if self.chunk_size >= self.max_chunk_size:
+                    # Convert to numpy array
+                    audio_data = np.array(self.current_chunk, dtype=self.config.dtype)
+                    
+                    # Generate filename with timestamp
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    audio_file = self.recordings_dir / f"recording_{timestamp}.wav"
+                    
+                    # Save the audio file directly
+                    self.save_audio_chunk(audio_data, str(audio_file))
+                    logging.info(f"Saved audio chunk to {audio_file}")
+                    
+                    # Reset chunk
+                    self.current_chunk = []
+                    self.chunk_size = 0
+                    
+                    # Clean up audio data immediately
+                    del audio_data
+                    
+            except Exception as e:
+                logging.error(f"Error in audio callback: {str(e)}")
+                # Reset chunk on error
+                self.current_chunk = []
+                self.chunk_size = 0
+
+    def save_audio_chunk(self, audio_data: np.ndarray, filename: str):
+        """Save audio chunk to file"""
+        try:
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(self.config.channels)
+                wf.setsampwidth(2)  # 2 bytes for int16
+                wf.setframerate(self.config.sample_rate)
+                wf.writeframes(audio_data.tobytes())
+        except Exception as e:
+            logging.error(f"Error saving audio chunk: {str(e)}")
+            raise
+
+    def start_recording(self):
+        """Start audio recording with optimized settings"""
+        self.recording = True
+        self.current_chunk = []
+        self.chunk_size = 0
+        
+        try:
+            self.stream = sd.InputStream(
+                samplerate=self.config.sample_rate,
+                channels=self.config.channels,
+                dtype=self.config.dtype,
+                callback=self.audio_callback,
+                blocksize=self.config.blocksize,
+                latency=self.config.latency,
+                device=self.input_device
+            )
+            self.stream.start()
+            logging.info("\nAudio stream started successfully")
+            logging.info(f"Stream settings: blocksize={self.config.blocksize}, latency={self.config.latency}")
+        except Exception as e:
+            logging.error(f"Error starting audio stream: {str(e)}")
+            raise
+
+    def stop_recording(self):
+        """Stop audio recording and cleanup"""
+        self.recording = False
+        try:
+            if hasattr(self, 'stream'):
+                self.stream.stop()
+                self.stream.close()
+                del self.stream
+            
+            # Save any remaining audio data
+            if self.current_chunk and self.chunk_size > 0:
+                audio_data = np.array(self.current_chunk, dtype=self.config.dtype)
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                audio_file = self.recordings_dir / f"recording_{timestamp}_partial.wav"
+                self.save_audio_chunk(audio_data, str(audio_file))
+                logging.info(f"Saved partial audio chunk to {audio_file}")
+                del audio_data
+            
+            self.current_chunk = []
+            self.chunk_size = 0
+            logging.info("Recording stopped.")
+        except Exception as e:
+            logging.error(f"Error stopping recording: {str(e)}")
+
+    def __del__(self):
+        """Cleanup when the object is destroyed"""
+        try:
+            self.stop_recording()
+        except Exception as e:
+            logging.warning(f"Error during simple audio recorder cleanup: {str(e)}")
+
+def process_recordings_in_range(start_time: datetime, end_time: datetime, model_config: TranscriptionConfig, diarization_config: Optional[DiarizationConfig] = None):
+    """Process all recordings within a specified time range"""
+    try:
+        # Initialize model manager
+        model_manager = ModelManager(model_config)
+        
+        # Get recordings directory
+        recordings_dir = Path("recordings")
+        if not recordings_dir.exists():
+            logging.error("Recordings directory not found")
+            return
+        
+        # Find all WAV files in the directory
+        wav_files = list(recordings_dir.glob("recording_*.wav"))
+        if not wav_files:
+            logging.error("No recording files found")
+            return
+        
+        # Filter files by date range
+        files_to_process = []
+        for wav_file in wav_files:
+            try:
+                # Extract timestamp from filename (format: recording_YYYYMMDD_HHMMSS.wav)
+                timestamp_str = wav_file.stem.split('_')[1] + '_' + wav_file.stem.split('_')[2]
+                file_time = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                
+                if start_time <= file_time <= end_time:
+                    files_to_process.append(wav_file)
+            except Exception as e:
+                logging.warning(f"Error parsing timestamp from {wav_file}: {str(e)}")
+                continue
+        
+        if not files_to_process:
+            logging.error(f"No recordings found between {start_time} and {end_time}")
+            return
+        
+        logging.info(f"Found {len(files_to_process)} recordings to process")
+        
+        # Process each file
+        for wav_file in sorted(files_to_process):
+            try:
+                logging.info(f"\nProcessing {wav_file.name}...")
+                
+                # Check if transcript already exists
+                transcript_file = wav_file.parent / f"transcript_{wav_file.stem.split('_')[1]}_{wav_file.stem.split('_')[2]}.json"
+                if transcript_file.exists():
+                    logging.info(f"Transcript already exists for {wav_file.name}, skipping...")
+                    continue
+                
+                # Validate and load audio
+                audio_data, _ = AudioValidator.validate_audio_file(str(wav_file))
+                audio_tensor = torch.from_numpy(audio_data).float().to(model_manager.device)
+                
+                # Transcribe
+                result = model_manager.transcribe(audio_tensor)
+                
+                # Get diarization if enabled
+                diarization_segments = []
+                if diarization_config:
+                    diarization_manager = DiarizationManager(diarization_config)
+                    diarization_segments = diarization_manager.process_audio(str(wav_file))
+                
+                # Save results
+                output = {
+                    "audio_file": str(wav_file),
+                    "transcription": result,
+                    "diarization": diarization_segments
+                }
+                
+                with open(transcript_file, 'w') as f:
+                    json.dump(output, f, indent=2)
+                
+                logging.info(f"Saved transcription to {transcript_file}")
+                
+                # Clean up
+                del audio_data
+                del audio_tensor
+                del result
+                del diarization_segments
+                del output
+                gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+            except Exception as e:
+                logging.error(f"Error processing {wav_file}: {str(e)}")
+                continue
+        
+        logging.info("\nBatch processing completed")
+        
+    except Exception as e:
+        logging.error(f"Fatal error during batch processing: {str(e)}")
+    finally:
+        # Clean up
+        if 'model_manager' in locals():
+            del model_manager
+        GPUManager.cleanup_memory()
+
 def main():
     parser = argparse.ArgumentParser(description='Whisper Transcription Tool')
-    parser.add_argument('--mode', choices=['file', 'continuous'], default='file',
-                      help='Transcription mode: "file" for single file, "continuous" for continuous recording')
-    parser.add_argument('--model', default='tiny.en',
-                      help='Model to use (tiny.en, base.en, etc.)')
+    parser.add_argument('--mode', choices=['file', 'continuous', 'batch'], default='file',
+                      help='Transcription mode: "file" for single file, "continuous" for continuous recording, "batch" for processing multiple recordings')
+    parser.add_argument('--model', default='base.en',
+                      help='Model to use (tiny.en, base.en, small.en, medium.en, large)')
     parser.add_argument('--audio_file', help='Path to audio file (required for file mode)')
-    parser.add_argument('--chunk_duration', type=int, default=600,
-                      help='Duration of audio chunks in seconds for continuous mode (default: 600)')
+    parser.add_argument('--chunk_duration', type=int, default=300,
+                      help='Duration of audio chunks in seconds for continuous mode (default: 300)')
     parser.add_argument('--language', default='en', help='Language for transcription')
     parser.add_argument('--hf_token', help='HuggingFace token for speaker diarization')
-    parser.add_argument('--num_speakers', type=int, help='Number of speakers (optional)')
+    parser.add_argument('--num_speakers', type=int, default=2,
+                      help='Number of speakers (optional)')
+    parser.add_argument('--temperature', type=float, default=0.0,
+                      help='Sampling temperature (0.0 = deterministic, higher = more random)')
+    parser.add_argument('--no_speech_threshold', type=float, default=0.3,
+                      help='Threshold for silence detection (0.0-1.0)')
+    parser.add_argument('--logprob_threshold', type=float, default=-0.7,
+                      help='Minimum log probability for tokens')
+    parser.add_argument('--compression_ratio', type=float, default=1.8,
+                      help='Maximum compression ratio for segments')
+    parser.add_argument('--initial_prompt', 
+                      default="This is a conversation between parents and children in a home environment.",
+                      help='Optional initial prompt to guide transcription')
+    parser.add_argument('--record_only', action='store_true',
+                      help='Only record audio without transcription (continuous mode only)')
+    parser.add_argument('--start_time', 
+                      help='Start time for batch processing (format: YYYY-MM-DD HH:MM:SS)')
+    parser.add_argument('--end_time',
+                      help='End time for batch processing (format: YYYY-MM-DD HH:MM:SS)')
     args = parser.parse_args()
 
     # Initialize logging
     AudioLogger()
     
-    # Check CUDA compatibility
-    GPUManager.check_cuda_compatibility()
+    # Check CUDA compatibility only if not in record-only mode
+    if not args.record_only:
+        GPUManager.check_cuda_compatibility()
     
-    if args.mode == 'file':
+    if args.mode == 'batch':
+        if not args.start_time or not args.end_time:
+            logging.error("Error: --start_time and --end_time are required in batch mode")
+            return
+            
+        try:
+            start_time = datetime.strptime(args.start_time, "%Y-%m-%d %H:%M:%S")
+            end_time = datetime.strptime(args.end_time, "%Y-%m-%d %H:%M:%S")
+            
+            model_config = TranscriptionConfig(
+                model_name=args.model,
+                language=args.language,
+                temperature=args.temperature,
+                no_speech_threshold=args.no_speech_threshold,
+                logprob_threshold=args.logprob_threshold,
+                compression_ratio_threshold=args.compression_ratio,
+                initial_prompt=args.initial_prompt
+            )
+            
+            diarization_config = None
+            if args.hf_token:
+                diarization_config = DiarizationConfig(
+                    use_auth_token=args.hf_token,
+                    num_speakers=args.num_speakers
+                )
+            
+            process_recordings_in_range(start_time, end_time, model_config, diarization_config)
+            
+        except ValueError as e:
+            logging.error(f"Error parsing date/time: {str(e)}")
+            return
+        except Exception as e:
+            logging.error(f"Fatal error: {str(e)}")
+            return
+    elif args.mode == 'file':
         if not args.audio_file:
             logging.error("Error: --audio_file is required in file mode")
             return
@@ -868,7 +1309,12 @@ def main():
         try:
             model_config = TranscriptionConfig(
                 model_name=args.model,
-                language=args.language
+                language=args.language,
+                temperature=args.temperature,
+                no_speech_threshold=args.no_speech_threshold,
+                logprob_threshold=args.logprob_threshold,
+                compression_ratio_threshold=args.compression_ratio,
+                initial_prompt=args.initial_prompt
             )
             model_manager = ModelManager(model_config)
             
@@ -911,26 +1357,46 @@ def main():
         try:
             model_config = TranscriptionConfig(
                 model_name=args.model,
-                language=args.language
+                language=args.language,
+                temperature=args.temperature,
+                no_speech_threshold=args.no_speech_threshold,
+                logprob_threshold=args.logprob_threshold,
+                compression_ratio_threshold=args.compression_ratio,
+                initial_prompt=args.initial_prompt
             )
             audio_config = AudioConfig(chunk_duration=args.chunk_duration)
             
             diarization_config = None
-            if args.hf_token:
+            if args.hf_token and not args.record_only:
                 diarization_config = DiarizationConfig(
                     use_auth_token=args.hf_token,
                     num_speakers=args.num_speakers
                 )
             
-            transcription_manager = TranscriptionManager(model_config, audio_config, diarization_config)
-            transcription_manager.start_continuous_transcription()
-            
-            while True:
-                time.sleep(1)
+            if args.record_only:
+                record_only_manager = SimpleAudioRecorder(audio_config)
+                record_only_manager.start_recording()
+                try:
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    logging.info("\nStopping recording...")
+                    record_only_manager.stop_recording()
+            else:
+                transcription_manager = TranscriptionManager(
+                    model_config, 
+                    audio_config, 
+                    diarization_config,
+                    record_only=args.record_only
+                )
+                transcription_manager.start_continuous_transcription()
                 
-        except KeyboardInterrupt:
-            logging.info("\nStopping recording...")
-            transcription_manager.stop_continuous_transcription()
+                try:
+                    while True:
+                        time.sleep(1)
+                except KeyboardInterrupt:
+                    logging.info("\nStopping recording...")
+                    transcription_manager.stop_continuous_transcription()
         except Exception as e:
             logging.error(f"Fatal error: {str(e)}")
             return

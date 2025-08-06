@@ -1,0 +1,91 @@
+LLM Analysis Recommendations for Family AI Product
+=================================================
+
+Product Context:
+- Family-focused AI system for parent-child coaching
+- Asynchronous coaching via passive listening devices
+- Real-time insights and educational content generation
+- "Bicycle for families" concept
+
+Key Requirements:
+- Analyze transcribed family conversations
+- Generate parenting insights and coaching
+- Provide inspiration ("I noticed you discussing owls...")
+- Real-time processing capability
+- Multimodal support for future "book" device
+
+Most Advanced LLM Options in Jetson Containers:
+===============================================
+
+1. **vLLM** (Most Advanced)
+   Models: Latest Llama 3.1, Mistral, Qwen, SOTA models
+   Pros: 
+   - Highest performance inference engine
+   - Support for largest/newest models (up to 70B parameters)
+   - Advanced features like paged attention
+   - Best throughput for batch processing
+   Cons: 
+   - Higher memory requirements
+   - More complex setup
+   - May be overkill for real-time family coaching
+
+2. **MLC (Machine Learning Compilation)**
+   Models: Llama 3, Mistral, mobile-optimized models
+   Pros:
+   - Excellent optimization for edge devices
+   - Good balance of performance/efficiency
+   - Mobile-first design philosophy
+   Cons:
+   - Limited model selection vs vLLM
+   - Compilation step required for new models
+
+3. **nano_llm vs Ollama Comparison:**
+
+| Feature           | nano_llm                    | Ollama                      |
+|-------------------|-----------------------------|-----------------------------|
+| Model Support     | Llama 2/3, multimodal      | Llama 3.1, Mistral, Gemma  |
+| Optimization      | Jetson-specific, TensorRT   | General ARM64 optimization |
+| Multimodal        | ✅ Built-in vision/audio    | ❌ Text-only               |
+| Real-time         | ✅ Optimized for streaming  | ⚠️ Good but not specialized |
+| Memory Usage      | Lower (optimized)           | Higher                      |
+| Model Management  | Manual                      | Excellent (auto-download)   |
+| API               | Python-native               | REST API                    |
+| Family Use Case   | Perfect fit                 | Good but generic            |
+
+RECOMMENDATION FOR FAMILY AI PRODUCT:
+====================================
+
+Primary: nano_llm + MLC combo
+- nano_llm for real-time family coaching and multimodal interactions
+- MLC for heavy analysis tasks (processing day's worth of transcriptions)
+
+Why nano_llm is ideal:
+
+Pros:
+- Multimodal capabilities - handles audio transcriptions + future vision for "book" device
+- Real-time streaming - perfect for "I noticed you discussing owls" style insights  
+- Memory efficient - can run alongside continuous recording
+- Jetson optimized - designed specifically for your hardware
+- Family-focused features - includes safety filtering, content generation
+
+Cons:
+- Smaller model selection than Ollama/vLLM
+- More technical setup than Ollama
+- Less community support than mainstream options
+
+For Maximum Capability Setup:
+```bash
+# Most capable setup
+./run.sh vllm      # For heavy analysis (Llama 3.1 70B if memory allows)
+./run.sh nano_llm  # For real-time family interactions
+```
+
+FINAL RECOMMENDATION:
+nano_llm as primary with vLLM for deep analysis - giving you both real-time responsiveness and maximum intelligence when needed.
+
+Commands to start:
+```bash
+cd /Users/ethan/jetson-containers
+./run.sh nano_llm    # Primary recommendation
+./run.sh vllm        # For advanced analysis
+```
