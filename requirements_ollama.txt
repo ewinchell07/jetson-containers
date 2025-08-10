@@ -1,0 +1,17 @@
+# Requirements for Family AI Analysis System (Ollama version)
+# Python 3.8+ required
+
+# HTTP requests for Ollama API
+requests>=2.31.0
+
+# For better error handling and retries
+urllib3>=2.0.0
+
+# Optional: For colored terminal output
+colorama>=0.4.6
+
+# Optional: For progress bars during analysis
+tqdm>=4.65.0
+
+# Optional: For better date parsing
+python-dateutil>=2.8.2
