@@ -1,16 +1,9 @@
 #!/usr/bin/env python3
 """
-Refactored Whisper-TRT Transcriber
-
-A clean, well-structured transcription system for Jetson Nano with:
-- GPU memory management
-- Model loading with fallback (Whisper -> Whisper-TRT)
-- Speaker diarization using Resemblyzer
-- Batch and single file processing
-- Comprehensive error handling and logging
-- Configurable transcription parameters
+Simplified transcription-only script for processing audio files.
+Extracts essential transcription functionality without the complexity and memory overhead
+of the full simple_transcribe.py system.
 """
-
 import os
 import torch
 import json
@@ -23,10 +16,8 @@ import whisper
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
-from typing import Optional, Dict, List, Any, Union
+from typing import Optional, Dict, List, Any
 import argparse
-from contextlib import contextmanager
-
 from config import (
     get_transcribe_model, get_transcribe_prompt, select_model_with_fallback,
     get_allow_swap, log_system_info, get_diarization_config, get_audio_config
@@ -39,53 +30,56 @@ try:
     import scipy.spatial.distance
     DIARIZATION_AVAILABLE = True
 except ImportError as e:
-    logging.warning(f"Diarization not available: {e}")
+    print(f"Warning: Diarization not available: {e}")
     DIARIZATION_AVAILABLE = False
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
+# Configuration function that uses config module
+def get_transcription_config():
+    """Get transcription configuration using config module"""
+    return {
+        # Decoding
+        "temperature": 0.0,                 # deterministic; fewer hallucinations
+        "beam_size": 5,                     # add beam search for robustness
+        "patience": 1.0,                    # avoid early cutoffs
 
-@dataclass
-class TranscriptionConfig:
-    """Configuration for transcription parameters"""
-    temperature: float = 0.0
-    beam_size: int = 5
-    patience: float = 1.0
-    no_speech_threshold: float = 0.7
-    logprob_threshold: float = -1.0
-    compression_ratio: float = 2.6
-    word_timestamps: bool = True
-    chunk_length: int = 30
-    chunk_overlap: int = 5
-    vad_filter: bool = True
-    language: str = "en"
-    condition_on_previous_text: bool = False
-    initial_prompt: str = ""
-    task: str = "transcribe"
+        # Noise & garbage suppression
+        "no_speech_threshold": 0.7,         # aggressively skip background/TV
+        "logprob_threshold": -1.0,          # drop very low-confidence tokens
+        "compression_ratio": 2.6, # filter compressed gibberish
 
+        # Chunking & timing
+        "word_timestamps": True,
+        "chunk_length": 30,                 # seconds per window
+        "chunk_overlap": 5,                 # seconds overlap (prevents word cuts)
+        "vad_filter": True,                 # if your wrapper supports it
 
-@dataclass
-class TranscriptionResult:
-    """Result of transcription process"""
-    text: str
-    segments: List[Dict[str, Any]]
-    speaker_segments: List[Dict[str, Any]]
-    merged_segments: List[Dict[str, Any]]
-    model_name: str
-    processing_time: float
-    gpu_memory_used: float
-    timestamp: str
-    audio_file: str
+        # Language & context
+        "language": "en",
+        "condition_on_previous_text": False,# reduces drift in noisy streams
+        "initial_prompt": get_transcribe_prompt(),
+
+        # Task
+        "task": "transcribe"
+    }
+
+# Configuration functions that use config module
+def get_diarization_config_local():
+    """Get diarization configuration using config module"""
+    return get_diarization_config()
+
+def get_audio_config_local():
+    """Get audio configuration using config module"""
+    return get_audio_config()
 
 
 class GPUManager:
-    """GPU memory management utilities"""
-    
+    """Simple GPU memory management"""
     @staticmethod
-    def cleanup_memory() -> None:
-        """Clean up GPU memory"""
+    def cleanup_memory():
         if torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
@@ -94,82 +88,22 @@ class GPUManager:
                 logging.warning(f"GPU cleanup error: {e}")
 
     @staticmethod
-    def get_memory_usage() -> float:
-        """Get current GPU memory usage in GB"""
+    def get_memory_usage():
         if torch.cuda.is_available():
-            return torch.cuda.memory_allocated() / 1024**3
-        return 0.0
-
-    @staticmethod
-    def get_device() -> torch.device:
-        """Get the appropriate device (CUDA if available, else CPU)"""
-        return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
-    @contextmanager
-    def memory_context(self):
-        """Context manager for GPU memory cleanup"""
-        try:
-            yield
-        finally:
-            self.cleanup_memory()
-
-
-class AudioProcessor:
-    """Audio preprocessing utilities"""
-    
-    def __init__(self, target_sample_rate: int = 16000):
-        self.target_sample_rate = target_sample_rate
-
-    def load_audio(self, audio_file: str) -> tuple[np.ndarray, int]:
-        """Load and preprocess audio file"""
-        try:
-            audio_data, sample_rate = sf.read(audio_file)
-            
-            # Ensure mono
-            if audio_data.ndim > 1:
-                audio_data = np.mean(audio_data, axis=1)
-            
-            # Resample if needed
-            if sample_rate != self.target_sample_rate:
-                logging.info(f"Resampling from {sample_rate} to {self.target_sample_rate} Hz")
-                import librosa
-                audio_data = librosa.resample(
-                    audio_data, 
-                    orig_sr=sample_rate, 
-                    target_sr=self.target_sample_rate
-                )
-            
-            # Normalize audio
-            audio_data = audio_data.astype(np.float32)
-            if np.max(np.abs(audio_data)) > 0:
-                audio_data = audio_data / np.max(np.abs(audio_data))
-            
-            return audio_data, self.target_sample_rate
-            
-        except Exception as e:
-            logging.error(f"Audio loading error: {e}")
-            raise
-
-    def audio_to_tensor(self, audio_data: np.ndarray, device: torch.device) -> torch.Tensor:
-        """Convert audio data to PyTorch tensor"""
-        audio_tensor = torch.from_numpy(audio_data)
-        if device.type == 'cuda':
-            audio_tensor = audio_tensor.to(device)
-        return audio_tensor
+            return torch.cuda.memory_allocated() / 1024**3  # GB
+        return 0
 
 
 class ModelManager:
     """Handles model loading and transcription"""
-    
-    def __init__(self, model_name: str, device: Optional[torch.device] = None):
+    def __init__(self, model_name: str):
         self.model_name = model_name
-        self.device = device or GPUManager.get_device()
+        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         self.model = None
-        self.audio_processor = AudioProcessor()
         self._load_model()
 
-    def _load_model(self) -> None:
-        """Load Whisper model with fallback to Whisper-TRT"""
+    def _load_model(self):
+        """Load Whisper model with fallback"""
         try:
             GPUManager.cleanup_memory()
             logging.info(f"Loading Whisper model: {self.model_name}")
@@ -177,7 +111,7 @@ class ModelManager:
             # Try regular Whisper first
             try:
                 self.model = whisper.load_model(self.model_name)
-                if self.device.type == 'cuda':
+                if torch.cuda.is_available():
                     self.model = self.model.to(self.device)
                 self.model.eval()
                 logging.info("Loaded regular Whisper model")
@@ -192,35 +126,70 @@ class ModelManager:
             logging.error(f"Failed to load model: {e}")
             raise
 
-    def transcribe_audio(self, audio_file: str, config: TranscriptionConfig) -> Dict[str, Any]:
-        """Transcribe audio file with given configuration"""
+    def transcribe_audio(self, audio_file: str) -> Dict[str, Any]:
+        """Transcribe audio file"""
         try:
             # Load and preprocess audio
             logging.info(f"Loading audio: {audio_file}")
-            audio_data, sample_rate = self.audio_processor.load_audio(audio_file)
-            audio_tensor = self.audio_processor.audio_to_tensor(audio_data, self.device)
+            audio_data, sample_rate = sf.read(audio_file)
+            
+            # Ensure mono
+            if audio_data.ndim > 1:
+                audio_data = np.mean(audio_data, axis=1)
+            
+            # Resample if needed
+            audio_config = get_audio_config_local()
+            if sample_rate != audio_config["target_sample_rate"]:
+                logging.info(f"Resampling from {sample_rate} to {audio_config['target_sample_rate']} Hz")
+                import librosa
+                audio_data = librosa.resample(
+                    audio_data, 
+                    orig_sr=sample_rate, 
+                    target_sr=audio_config["target_sample_rate"]
+                )
+            
+            # Normalize audio
+            audio_data = audio_data.astype(np.float32)
+            if np.max(np.abs(audio_data)) > 0:
+                audio_data = audio_data / np.max(np.abs(audio_data))
+            
+            # Convert to tensor
+            audio_tensor = torch.from_numpy(audio_data)
+            if torch.cuda.is_available():
+                audio_tensor = audio_tensor.to(self.device)
             
             # Clean memory before transcription
             GPUManager.cleanup_memory()
             
             # Transcribe
             logging.info("Starting transcription...")
-            start_time = datetime.now()
-            
+            transcription_config = get_transcription_config()
             if isinstance(self.model, whisper.Whisper):
-                result = self._transcribe_with_whisper(audio_tensor, config)
+                with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+                    with torch.no_grad():
+                        result = self.model.transcribe(
+                            audio_tensor,
+                            language=transcription_config["language"],
+                            task=transcription_config["task"],
+                            fp16=torch.cuda.is_available(),
+                            verbose=True,
+                            temperature=transcription_config["temperature"],
+                            no_speech_threshold=transcription_config["no_speech_threshold"],
+                            logprob_threshold=transcription_config["logprob_threshold"],
+                            compression_ratio_threshold=transcription_config["compression_ratio"],
+                            condition_on_previous_text=transcription_config["condition_on_previous_text"],
+                            initial_prompt=transcription_config["initial_prompt"],
+                            word_timestamps=transcription_config["word_timestamps"]
+                        )
             else:
                 # TRT model
                 result = self.model.transcribe(audio_tensor)
             
-            processing_time = (datetime.now() - start_time).total_seconds()
-            
             if not result or not result.get('text'):
                 logging.warning("Empty transcription result")
-                return {"text": "", "segments": [], "processing_time": processing_time}
+                return {"text": "", "segments": []}
             
-            result["processing_time"] = processing_time
-            logging.info(f"Transcription completed in {processing_time:.2f}s. Text length: {len(result['text'])}")
+            logging.info(f"Transcription completed. Text length: {len(result['text'])}")
             return result
             
         except Exception as e:
@@ -229,27 +198,8 @@ class ModelManager:
         finally:
             GPUManager.cleanup_memory()
 
-    def _transcribe_with_whisper(self, audio_tensor: torch.Tensor, config: TranscriptionConfig) -> Dict[str, Any]:
-        """Transcribe using regular Whisper model"""
-        with torch.cuda.amp.autocast(enabled=self.device.type == 'cuda'):
-            with torch.no_grad():
-                return self.model.transcribe(
-                    audio_tensor,
-                    language=config.language,
-                    task=config.task,
-                    fp16=self.device.type == 'cuda',
-                    verbose=True,
-                    temperature=config.temperature,
-                    no_speech_threshold=config.no_speech_threshold,
-                    logprob_threshold=config.logprob_threshold,
-                    compression_ratio_threshold=config.compression_ratio,
-                    condition_on_previous_text=config.condition_on_previous_text,
-                    initial_prompt=config.initial_prompt,
-                    word_timestamps=config.word_timestamps
-                )
-
     def __del__(self):
-        """Cleanup model resources"""
+        """Cleanup"""
         try:
             if self.model:
                 del self.model
@@ -260,12 +210,12 @@ class ModelManager:
 
 class DiarizationManager:
     """Handles speaker diarization using Resemblyzer"""
-    
-    def __init__(self, hf_token: Optional[str] = None):
+    def __init__(self, hf_token: str = None):
+        # hf_token is kept for compatibility but not used with resemblyzer
         self.encoder = None
         self._load_encoder()
 
-    def _load_encoder(self) -> None:
+    def _load_encoder(self):
         """Load Resemblyzer voice encoder"""
         try:
             logging.info("Loading Resemblyzer voice encoder...")
@@ -277,7 +227,7 @@ class DiarizationManager:
 
     def _segment_audio(self, wav: np.ndarray, sample_rate: int) -> List[Dict[str, Any]]:
         """Segment audio into overlapping chunks for speaker analysis"""
-        diarization_config = get_diarization_config()
+        diarization_config = get_diarization_config_local()
         segment_duration = diarization_config["segment_duration"]
         overlap_duration = diarization_config["overlap_duration"]
         
@@ -302,8 +252,10 @@ class DiarizationManager:
         """Cluster speaker embeddings to identify different speakers"""
         from sklearn.cluster import AgglomerativeClustering
         
-        diarization_config = get_diarization_config()
+        diarization_config = get_diarization_config_local()
         if num_speakers is None:
+            # Use hierarchical clustering to determine number of speakers
+            # This is a simple heuristic - in practice you might want more sophisticated methods
             num_speakers = min(max(2, len(embeddings) // 10), diarization_config["max_speakers"])
         
         num_speakers = max(diarization_config["min_speakers"], 
@@ -315,7 +267,7 @@ class DiarizationManager:
         return speaker_labels
 
     def process_audio(self, audio_file: str, num_speakers: Optional[int] = None) -> List[Dict[str, Any]]:
-        """Process audio for speaker diarization"""
+        """Process audio for speaker diarization using Resemblyzer"""
         try:
             logging.info(f"Processing diarization for: {audio_file}")
             
@@ -327,18 +279,34 @@ class DiarizationManager:
             segments = self._segment_audio(wav, sample_rate)
             logging.info(f"Created {len(segments)} segments for analysis")
             
-            # Extract speaker embeddings
-            embeddings = self._extract_embeddings(segments)
+            # Extract speaker embeddings for each segment
+            embeddings = []
+            for segment in segments:
+                try:
+                    embedding = self.encoder.embed_utterance(segment["wav"])
+                    embeddings.append(embedding)
+                except Exception as e:
+                    logging.warning(f"Failed to extract embedding for segment {segment['start']:.2f}-{segment['end']:.2f}: {e}")
+                    # Use zero embedding as fallback
+                    embeddings.append(np.zeros(256))  # Resemblyzer embeddings are 256-dimensional
             
             if not embeddings:
                 logging.warning("No embeddings extracted")
                 return []
             
+            embeddings = np.array(embeddings)
+            
             # Cluster speakers
             speaker_labels = self._cluster_speakers(embeddings, num_speakers)
             
             # Create speaker segments
-            speaker_segments = self._create_speaker_segments(segments, speaker_labels)
+            speaker_segments = []
+            for i, (segment, speaker_id) in enumerate(zip(segments, speaker_labels)):
+                speaker_segments.append({
+                    "start": segment["start"],
+                    "end": segment["end"],
+                    "speaker": f"SPEAKER_{speaker_id:02d}"
+                })
             
             logging.info(f"Found {len(set(speaker_labels))} speakers in {len(speaker_segments)} segments")
             return speaker_segments
@@ -347,33 +315,8 @@ class DiarizationManager:
             logging.error(f"Diarization error: {e}")
             return []
 
-    def _extract_embeddings(self, segments: List[Dict[str, Any]]) -> np.ndarray:
-        """Extract embeddings for all segments"""
-        embeddings = []
-        for segment in segments:
-            try:
-                embedding = self.encoder.embed_utterance(segment["wav"])
-                embeddings.append(embedding)
-            except Exception as e:
-                logging.warning(f"Failed to extract embedding for segment {segment['start']:.2f}-{segment['end']:.2f}: {e}")
-                # Use zero embedding as fallback
-                embeddings.append(np.zeros(256))
-        
-        return np.array(embeddings) if embeddings else np.array([])
-
-    def _create_speaker_segments(self, segments: List[Dict[str, Any]], speaker_labels: List[int]) -> List[Dict[str, Any]]:
-        """Create speaker segments from segments and labels"""
-        speaker_segments = []
-        for segment, speaker_id in zip(segments, speaker_labels):
-            speaker_segments.append({
-                "start": segment["start"],
-                "end": segment["end"],
-                "speaker": f"SPEAKER_{speaker_id:02d}"
-            })
-        return speaker_segments
-
     def __del__(self):
-        """Cleanup encoder resources"""
+        """Cleanup"""
         try:
             if self.encoder:
                 del self.encoder
@@ -382,90 +325,11 @@ class DiarizationManager:
             logging.warning(f"Diarization cleanup error: {e}")
 
 
-class SpeakerMerger:
-    """Handles merging transcription with speaker diarization"""
-    
-    @staticmethod
-    def merge_transcription_with_speakers(transcription: Dict[str, Any], 
-                                        speaker_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Merge Whisper transcription segments with speaker diarization"""
-        if not speaker_segments or 'segments' not in transcription:
-            return transcription.get('segments', [])
-        
-        def get_speaker_at_time(timestamp: float) -> Optional[str]:
-            for seg in speaker_segments:
-                if seg['start'] <= timestamp <= seg['end']:
-                    return seg['speaker']
-            return None
-        
-        merged_segments = []
-        for seg in transcription['segments']:
-            mid_time = (seg['start'] + seg['end']) / 2
-            speaker = get_speaker_at_time(mid_time)
-            
-            enhanced_seg = seg.copy()
-            enhanced_seg['speaker'] = speaker
-            enhanced_seg['speaker_confidence'] = SpeakerMerger._calculate_speaker_confidence(
-                seg['start'], seg['end'], speaker_segments, speaker
-            )
-            
-            merged_segments.append(enhanced_seg)
-        
-        return merged_segments
-    
-    @staticmethod
-    def _calculate_speaker_confidence(start: float, end: float, 
-                                    speaker_segments: List[Dict[str, Any]], 
-                                    assigned_speaker: str) -> float:
-        """Calculate confidence that the assigned speaker is correct"""
-        if not assigned_speaker:
-            return 0.0
-        
-        total_overlap = 0.0
-        segment_duration = end - start
-        
-        for seg in speaker_segments:
-            if seg['speaker'] == assigned_speaker:
-                overlap_start = max(start, seg['start'])
-                overlap_end = min(end, seg['end'])
-                if overlap_start < overlap_end:
-                    total_overlap += overlap_end - overlap_start
-        
-        return total_overlap / segment_duration if segment_duration > 0 else 0.0
-    
-    @staticmethod
-    def deduplicate_speaker_segments(speaker_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Remove overlapping speaker segments and merge adjacent ones"""
-        if not speaker_segments:
-            return []
-        
-        sorted_segments = sorted(speaker_segments, key=lambda x: x['start'])
-        deduplicated = []
-        
-        for seg in sorted_segments:
-            if not deduplicated:
-                deduplicated.append(seg)
-                continue
-            
-            last_seg = deduplicated[-1]
-            
-            if (seg['speaker'] == last_seg['speaker'] and 
-                seg['start'] <= last_seg['end'] + 0.1):  # 0.1s tolerance
-                last_seg['end'] = max(last_seg['end'], seg['end'])
-            else:
-                deduplicated.append(seg)
-        
-        return deduplicated
-
-
 class Transcriber:
-    """Main transcription processor with clean architecture"""
-    
+    """Main transcription processor"""
     def __init__(self, model_name: str, hf_token: Optional[str] = None, enable_diarization: bool = True):
         self.model_manager = ModelManager(model_name)
         self.diarization_manager = None
-        self.speaker_merger = SpeakerMerger()
-        
         if enable_diarization and DIARIZATION_AVAILABLE:
             try:
                 self.diarization_manager = DiarizationManager(hf_token)
@@ -478,8 +342,87 @@ class Transcriber:
         
         self._setup_logging()
 
-    def _setup_logging(self) -> None:
-        """Setup logging configuration"""
+    def _merge_transcription_with_speakers(self, transcription: Dict[str, Any], 
+                                         speaker_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Merge Whisper transcription segments with speaker diarization"""
+        if not speaker_segments or 'segments' not in transcription:
+            return transcription.get('segments', [])
+        
+        # Create speaker lookup by time
+        def get_speaker_at_time(timestamp: float) -> Optional[str]:
+            for seg in speaker_segments:
+                if seg['start'] <= timestamp <= seg['end']:
+                    return seg['speaker']
+            return None
+        
+        # Process each transcription segment
+        merged_segments = []
+        for seg in transcription['segments']:
+            # Get speaker for the middle of the segment
+            mid_time = (seg['start'] + seg['end']) / 2
+            speaker = get_speaker_at_time(mid_time)
+            
+            # Add speaker info to segment
+            enhanced_seg = seg.copy()
+            enhanced_seg['speaker'] = speaker
+            enhanced_seg['speaker_confidence'] = self._calculate_speaker_confidence(
+                seg['start'], seg['end'], speaker_segments, speaker
+            )
+            
+            merged_segments.append(enhanced_seg)
+        
+        return merged_segments
+    
+    def _calculate_speaker_confidence(self, start: float, end: float, 
+                                    speaker_segments: List[Dict[str, Any]], 
+                                    assigned_speaker: str) -> float:
+        """Calculate confidence that the assigned speaker is correct for this segment"""
+        if not assigned_speaker:
+            return 0.0
+        
+        # Find overlap with speaker segments
+        total_overlap = 0.0
+        segment_duration = end - start
+        
+        for seg in speaker_segments:
+            if seg['speaker'] == assigned_speaker:
+                # Calculate overlap
+                overlap_start = max(start, seg['start'])
+                overlap_end = min(end, seg['end'])
+                if overlap_start < overlap_end:
+                    total_overlap += overlap_end - overlap_start
+        
+        return total_overlap / segment_duration if segment_duration > 0 else 0.0
+    
+    def _deduplicate_speaker_segments(self, speaker_segments: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Remove overlapping speaker segments and merge adjacent ones"""
+        if not speaker_segments:
+            return []
+        
+        # Sort by start time
+        sorted_segments = sorted(speaker_segments, key=lambda x: x['start'])
+        deduplicated = []
+        
+        for seg in sorted_segments:
+            if not deduplicated:
+                deduplicated.append(seg)
+                continue
+            
+            last_seg = deduplicated[-1]
+            
+            # Check for overlap or adjacency with same speaker
+            if (seg['speaker'] == last_seg['speaker'] and 
+                seg['start'] <= last_seg['end'] + 0.1):  # 0.1s tolerance
+                # Merge segments
+                last_seg['end'] = max(last_seg['end'], seg['end'])
+            else:
+                # Add as new segment
+                deduplicated.append(seg)
+        
+        return deduplicated
+
+    def _setup_logging(self):
+        """Setup logging"""
         log_dir = Path.home() / ".cache" / "whisper_trt" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"transcriber_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
@@ -495,8 +438,8 @@ class Transcriber:
         logging.info(f"Logging to: {log_file}")
 
     def process_file(self, audio_file: str, output_dir: str = "transcriptions", 
-                    num_speakers: Optional[int] = None) -> TranscriptionResult:
-        """Process single audio file and return structured result"""
+                    num_speakers: Optional[int] = None) -> Dict[str, Any]:
+        """Process single audio file"""
         try:
             audio_path = Path(audio_file)
             if not audio_path.exists():
@@ -513,75 +456,45 @@ class Transcriber:
             logging.info(f"Processing: {audio_file}")
             logging.info(f"Output will be saved to: {output_file}")
             
-            # Create transcription configuration
-            config = TranscriptionConfig(
-                initial_prompt=get_transcribe_prompt(),
-                **get_audio_config()
-            )
-            
             # Transcribe
-            result = self.model_manager.transcribe_audio(audio_file, config)
+            result = self.model_manager.transcribe_audio(audio_file)
             
             # Add diarization if available
             speaker_segments = []
             merged_segments = []
             if self.diarization_manager:
                 raw_speaker_segments = self.diarization_manager.process_audio(audio_file, num_speakers)
-                speaker_segments = self.speaker_merger.deduplicate_speaker_segments(raw_speaker_segments)
-                merged_segments = self.speaker_merger.merge_transcription_with_speakers(result, speaker_segments)
+                speaker_segments = self._deduplicate_speaker_segments(raw_speaker_segments)
+                merged_segments = self._merge_transcription_with_speakers(result, speaker_segments)
                 logging.info(f"Merged {len(result.get('segments', []))} transcription segments with {len(speaker_segments)} speaker segments")
             
-            # Create structured result
-            transcription_result = TranscriptionResult(
-                text=result.get('text', ''),
-                segments=result.get('segments', []),
-                speaker_segments=speaker_segments,
-                merged_segments=merged_segments,
-                model_name=self.model_manager.model_name,
-                processing_time=result.get('processing_time', 0.0),
-                gpu_memory_used=GPUManager.get_memory_usage(),
-                timestamp=datetime.now().isoformat(),
-                audio_file=str(audio_path.absolute())
-            )
+            # Combine results
+            output_data = {
+                "timestamp": datetime.now().isoformat(),
+                "audio_file": str(audio_path.absolute()),
+                "model": self.model_manager.model_name,
+                "transcription": result,
+                "speaker_segments": speaker_segments,
+                "merged_segments": merged_segments,  # New: segments with speaker info
+                "gpu_memory_used_gb": GPUManager.get_memory_usage(),
+                "config": get_transcription_config()
+            }
             
             # Save results
-            self._save_results(transcription_result, output_file)
+            with open(output_file, 'w', encoding='utf-8') as f:
+                json.dump(output_data, f, indent=2, ensure_ascii=False)
             
             logging.info(f"Transcription saved to: {output_file}")
-            logging.info(f"Transcribed text: {transcription_result.text[:200]}...")
+            logging.info(f"Transcribed text: {result.get('text', '')[:200]}...")
             
-            return transcription_result
+            return output_data
             
         except Exception as e:
             logging.error(f"Error processing file: {e}")
             raise
 
-    def _save_results(self, result: TranscriptionResult, output_file: Path) -> None:
-        """Save transcription results to JSON file"""
-        output_data = {
-            "timestamp": result.timestamp,
-            "audio_file": result.audio_file,
-            "model": result.model_name,
-            "transcription": {
-                "text": result.text,
-                "segments": result.segments
-            },
-            "speaker_segments": result.speaker_segments,
-            "merged_segments": result.merged_segments,
-            "gpu_memory_used_gb": result.gpu_memory_used,
-            "processing_time_seconds": result.processing_time,
-            "config": {
-                "temperature": 0.0,
-                "language": "en",
-                "task": "transcribe"
-            }
-        }
-        
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(output_data, f, indent=2, ensure_ascii=False)
-
     def process_batch(self, audio_dir: str, output_dir: str = "transcriptions", 
-                     pattern: str = "*.wav", num_speakers: Optional[int] = None) -> List[TranscriptionResult]:
+                     pattern: str = "*.wav", num_speakers: Optional[int] = None) -> List[Dict[str, Any]]:
         """Process multiple audio files"""
         audio_path = Path(audio_dir)
         audio_files = list(audio_path.glob(pattern))
@@ -610,39 +523,7 @@ class Transcriber:
         return results
 
 
-def get_transcription_config() -> Dict[str, Any]:
-    """Get transcription configuration (legacy compatibility)"""
-    config = TranscriptionConfig(initial_prompt=get_transcribe_prompt())
-    return {
-        "temperature": config.temperature,
-        "beam_size": config.beam_size,
-        "patience": config.patience,
-        "no_speech_threshold": config.no_speech_threshold,
-        "logprob_threshold": config.logprob_threshold,
-        "compression_ratio": config.compression_ratio,
-        "word_timestamps": config.word_timestamps,
-        "chunk_length": config.chunk_length,
-        "chunk_overlap": config.chunk_overlap,
-        "vad_filter": config.vad_filter,
-        "language": config.language,
-        "condition_on_previous_text": config.condition_on_previous_text,
-        "initial_prompt": config.initial_prompt,
-        "task": config.task
-    }
-
-
-def get_diarization_config_local() -> Dict[str, Any]:
-    """Get diarization configuration (legacy compatibility)"""
-    return get_diarization_config()
-
-
-def get_audio_config_local() -> Dict[str, Any]:
-    """Get audio configuration (legacy compatibility)"""
-    return get_audio_config()
-
-
 def main():
-    """Main entry point for command-line usage"""
     parser = argparse.ArgumentParser(description="Audio Transcription Tool")
     parser.add_argument("audio_file", help="Audio file to transcribe (or directory for batch mode)")
     parser.add_argument("--model", default=None, 
@@ -694,7 +575,7 @@ def main():
                 args.output_dir, 
                 args.num_speakers
             )
-            print(f"Transcription: {result.text}")
+            print(f"Transcription: {result['transcription']['text']}")
             
     except Exception as e:
         logging.error(f"Processing failed: {e}")
