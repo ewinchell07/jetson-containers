@@ -515,8 +515,7 @@ class Transcriber:
             
             # Create transcription configuration
             config = TranscriptionConfig(
-                initial_prompt=get_transcribe_prompt(),
-                **get_audio_config()
+                initial_prompt=get_transcribe_prompt()
             )
             
             # Transcribe
