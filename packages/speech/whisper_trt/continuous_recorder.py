@@ -281,7 +281,7 @@ class ContinuousRecorder:
             return audio_data  # Return original if resampling fails
 
     def _save_current_chunk(self, partial: bool = False):
-        """Save the current audio chunk to file - both original and resampled versions"""
+        """Save the current audio chunk to file at target sample rate"""
         if not self.current_chunk:
             return
             
@@ -294,69 +294,42 @@ class ContinuousRecorder:
                 audio_data = self._amplify_audio(audio_data)
                 logging.debug(f"Applied amplification: normalize={self.config.normalize_audio}, gain={self.config.gain_boost}x")
             
-            # Generate base filename
+            # Generate filename
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             suffix = "_partial" if partial else ""
+            filename = f"recording_{timestamp}{suffix}.wav"
+            filepath = self.output_dir / filename
             
-            # Save original file at native sample rate
-            original_filename = f"recording_{timestamp}{suffix}_{self.config.native_sample_rate//1000}k.wav"
-            original_filepath = self.output_dir / original_filename
+            # Resample to target sample rate if needed
+            if self.config.native_sample_rate != self.config.target_sample_rate:
+                audio_data = self._resample_audio(audio_data, self.config.native_sample_rate, self.config.target_sample_rate)
+                sample_rate = self.config.target_sample_rate
+            else:
+                sample_rate = self.config.native_sample_rate
+                logging.debug("No resampling needed - native rate matches target rate")
             
             # Use soundfile for better format support
             try:
                 import soundfile as sf
-                sf.write(str(original_filepath), audio_data, self.config.native_sample_rate)
+                sf.write(str(filepath), audio_data, sample_rate)
                 logging.info(f"Saved using soundfile (better quality)")
             except ImportError:
                 # Fallback to wave module
-                with wave.open(str(original_filepath), 'wb') as wf:
+                with wave.open(str(filepath), 'wb') as wf:
                     wf.setnchannels(self.config.channels)
-                    if self.config.dtype == np.float32:
+                    if audio_data.dtype == np.float32:
                         # Convert float32 to int16 for wave module
                         audio_int16 = (audio_data * 32767).astype(np.int16)
                         wf.setsampwidth(2)
-                        wf.setframerate(self.config.native_sample_rate)
+                        wf.setframerate(sample_rate)
                         wf.writeframes(audio_int16.tobytes())
                     else:
                         wf.setsampwidth(2)  # 2 bytes for int16
-                        wf.setframerate(self.config.native_sample_rate)
+                        wf.setframerate(sample_rate)
                         wf.writeframes(audio_data.tobytes())
             
-            original_duration = len(audio_data) / self.config.native_sample_rate
-            logging.info(f"Saved {original_duration:.1f}s original audio ({self.config.native_sample_rate}Hz) to: {original_filename}")
-            
-            # Save resampled file for transcription
-            if self.config.native_sample_rate != self.config.target_sample_rate:
-                resampled_data = self._resample_audio(audio_data, self.config.native_sample_rate, self.config.target_sample_rate)
-                
-                resampled_filename = f"recording_{timestamp}{suffix}.wav"
-                resampled_filepath = self.output_dir / resampled_filename
-                
-                # Use soundfile for better format support
-                try:
-                    import soundfile as sf
-                    sf.write(str(resampled_filepath), resampled_data, self.config.target_sample_rate)
-                except ImportError:
-                    # Fallback to wave module
-                    with wave.open(str(resampled_filepath), 'wb') as wf:
-                        wf.setnchannels(self.config.channels)
-                        if resampled_data.dtype == np.float32:
-                            # Convert float32 to int16 for wave module
-                            audio_int16 = (resampled_data * 32767).astype(np.int16)
-                            wf.setsampwidth(2)
-                            wf.setframerate(self.config.target_sample_rate)
-                            wf.writeframes(audio_int16.tobytes())
-                        else:
-                            wf.setsampwidth(2)  # 2 bytes for int16
-                            wf.setframerate(self.config.target_sample_rate)
-                            wf.writeframes(resampled_data.tobytes())
-                
-                resampled_duration = len(resampled_data) / self.config.target_sample_rate
-                logging.info(f"Saved {resampled_duration:.1f}s resampled audio ({self.config.target_sample_rate}Hz) to: {resampled_filename}")
-                
-                del resampled_data
-            else:
-                logging.info("No resampling needed - native rate matches target rate")
+            duration = len(audio_data) / sample_rate
+            logging.info(f"Saved {duration:.1f}s audio ({sample_rate}Hz) to: {filename}")
             
             # Clean up
             del audio_data

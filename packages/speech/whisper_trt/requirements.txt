@@ -1,11 +1,8 @@
 whisper-trt
 torch==2.1.0
-torchaudio==2.1.0
-torchvision==0.16.2+c6f3977
-pyannote.audio==3.1.1
-numpy
+resemblyzer==0.1.4
+numpy==1.26.4
 soundfile
 sounddevice
 librosa
-pytorch-lightning==2.1.0
-torchmetrics==1.3.0 
+scikit-learn

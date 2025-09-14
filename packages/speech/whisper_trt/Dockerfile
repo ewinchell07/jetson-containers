@@ -26,6 +26,8 @@ WORKDIR /opt/whisper_trt
 COPY requirements.txt .
 
 # Install Python dependencies
+ENV PIP_INDEX_URL=https://pypi.org/simple
+ENV PIP_EXTRA_INDEX_URL=https://developer.download.nvidia.com/compute/redist/jp/v44
 RUN pip3 install --no-cache-dir -r requirements.txt
 
 # Copy the application code
