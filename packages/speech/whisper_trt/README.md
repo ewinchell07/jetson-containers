@@ -5,11 +5,14 @@ A robust, production-ready speech transcription system optimized for NVIDIA Jets
 ## 🚀 Key Features
 
 - **GPU-Accelerated Transcription**: Uses Whisper-TRT (TensorRT optimized) with automatic fallback to regular Whisper
+- **Adaptive Quality-Based Model Selection**: Automatically retries with larger models when transcription quality is insufficient
 - **Speaker Diarization**: Resemblyzer-based speaker identification optimized for Jetson devices
 - **Smart Model Selection**: Automatic model selection with fallback based on available system resources
+- **Quality Assessment**: Comprehensive quality metrics including confidence, false speech detection, and repetition analysis
 - **Memory Management**: Comprehensive GPU memory management and cleanup
 - **Batch Processing**: Process single files or entire directories
 - **Audio Preprocessing**: Automatic noise suppression, filtering, and normalization
+- **Reprocessing Tools**: Reprocess existing transcripts with adaptive quality improvements
 - **Jetson Optimized**: Specifically designed for Jetson Nano and other Jetson devices
 - **Comprehensive Testing**: Full test suite with Jetson-specific tests
 
@@ -79,6 +82,14 @@ export MAX_DURATION_MIN=30              # Skip files longer than this
 
 # Custom transcription prompt (optional)
 export TRANSCRIBE_PROMPT="Your custom prompt here"
+
+# Adaptive quality settings (NEW)
+export ENABLE_QUALITY_RETRY=true          # Enable adaptive quality retry
+export QUALITY_THRESHOLD=0.3              # Quality threshold (0.0=perfect, 1.0=terrible)
+export MAX_QUALITY_RETRIES=2              # Maximum retries with larger models
+export AVG_LOGPROB_THRESHOLD=-1.2         # Log probability threshold
+export NO_SPEECH_PROB_THRESHOLD=0.4       # No-speech probability threshold
+export COMPRESSION_RATIO_THRESHOLD=3.0    # Compression ratio threshold
 ```
 
 ### Jetson Nano Swap Setup
@@ -103,7 +114,7 @@ For larger Whisper models on Jetson Nano:
 ### 1. Single File Transcription
 
 ```bash
-# Basic transcription
+# Basic transcription (now with adaptive quality)
 python3 transcriber.py audio.wav
 
 # With specific model
@@ -114,6 +125,10 @@ python3 transcriber.py audio.wav --model medium --num-speakers 2
 
 # Custom output directory
 python3 transcriber.py audio.wav --output-dir my_transcriptions
+
+# Disable adaptive quality (use original behavior)
+export ENABLE_QUALITY_RETRY=false
+python3 transcriber.py audio.wav
 ```
 
 ### 2. Batch Processing
@@ -129,7 +144,26 @@ python3 transcriber.py recordings/ --batch --pattern "*.mp3"
 python3 transcriber.py recordings/ --batch --num-speakers 2
 ```
 
-### 3. Continuous Recording
+### 3. Adaptive Quality Features (NEW)
+
+```bash
+# Analyze quality of existing transcripts
+python3 test_quality_analysis.py transcriptions/ --quality-threshold 0.3
+
+# Reprocess low-quality transcripts with adaptive quality
+python3 reprocess_adaptive.py transcriptions/ \
+  --quality-threshold 0.25 \
+  --min-improvement 0.1 \
+  --output-dir improved_transcripts/
+
+# Test adaptive transcription on new audio
+python3 test_adaptive.py --audio-file audio.wav --verbose
+
+# Compare original vs improved transcripts
+python3 test_adaptive.py --compare original.json improved.json
+```
+
+### 4. Continuous Recording
 
 ```bash
 # Basic continuous recording
@@ -150,6 +184,8 @@ python3 continuous_recorder.py --chunk-duration 600 --buffer-size 4096 --latency
 | `--no-diarization` | Disable speaker diarization | False |
 | `--batch` | Process all audio files in directory | False |
 | `--pattern` | File pattern for batch processing | `*.wav` |
+| `--quality-threshold` | Quality threshold for adaptive retry | `0.3` |
+| `--max-retries` | Maximum retries with larger models | `2` |
 
 ## 🧪 Testing
 
@@ -177,43 +213,89 @@ python3 test_transcriber.py
 - **Integration Tests**: End-to-end transcription pipeline
 - **Batch Processing Tests**: Test batch processing functionality
 
+## 🎯 Quality Assessment
+
+The system automatically assesses transcription quality using four key metrics:
+
+### Quality Metrics
+
+1. **Average Log Probability** (40% weight)
+   - Measures model confidence in transcription
+   - Good values: -0.5 to -1.0
+   - Poor values: Below -1.5
+
+2. **No Speech Probability** (30% weight)
+   - Detects false speech detection
+   - Good values: 0.1 to 0.3
+   - Poor values: Above 0.5
+
+3. **Compression Ratio** (20% weight)
+   - Measures repetition in transcription
+   - Good values: 1.0 to 2.0
+   - Poor values: Above 3.0
+
+4. **Fragmentation** (10% weight)
+   - Measures segment quality
+   - Good values: 3-8 segments per minute
+   - Poor values: Below 2 or above 20 per minute
+
+### Quality Score Interpretation
+
+| Score Range | Quality Level | Action |
+|-------------|---------------|---------|
+| 0.0 - 0.2   | Excellent     | No retry needed |
+| 0.2 - 0.3   | Good          | No retry needed |
+| 0.3 - 0.5   | Fair          | Consider retry |
+| 0.5 - 0.7   | Poor          | Retry recommended |
+| 0.7 - 1.0   | Terrible      | Retry required |
+
 ## 🏗️ Architecture
 
 ### Core Components
 
 - **`Transcriber`**: Main transcription processor with clean architecture
+- **`AdaptiveTranscriber`**: Quality-based model selection and retry logic
 - **`ModelManager`**: Handles model loading with Whisper-TRT fallback
 - **`DiarizationManager`**: Resemblyzer-based speaker diarization
 - **`GPUManager`**: GPU memory management and cleanup
 - **`AudioProcessor`**: Audio preprocessing and format conversion
 - **`SpeakerMerger`**: Merges transcription with speaker information
+- **`QualityAnalyzer`**: Standalone quality assessment tools
 
 ### Data Flow
 
 1. **Audio Input** → Audio preprocessing and normalization
 2. **Model Loading** → Whisper model with TensorRT optimization
 3. **Transcription** → GPU-accelerated speech-to-text
-4. **Diarization** → Speaker identification and clustering
-5. **Merging** → Combine transcription with speaker information
-6. **Output** → JSON results with comprehensive metadata
+4. **Quality Assessment** → Analyze transcription quality metrics
+5. **Adaptive Retry** → Retry with larger model if quality insufficient
+6. **Diarization** → Speaker identification and clustering
+7. **Merging** → Combine transcription with speaker information
+8. **Output** → JSON results with comprehensive metadata
 
 ## 📁 File Structure
 
 ```
 whisper_trt/
 ├── transcriber.py              # Main transcription system
-├── config.py                   # Configuration management
-├── continuous_recorder.py      # Continuous audio recording
+├── adaptive_transcriber.py      # Adaptive quality-based model selection
+├── reprocess_adaptive.py        # Reprocess existing transcripts
+├── test_quality_analysis.py     # Standalone quality analysis
+├── test_adaptive.py             # Adaptive quality testing
+├── adaptive_config.yaml         # Quality configuration
+├── config.py                    # Configuration management
+├── continuous_recorder.py       # Continuous audio recording
 ├── audio/
-│   └── preprocess.py          # Audio preprocessing utilities
+│   └── preprocess.py           # Audio preprocessing utilities
 ├── scripts/
-│   └── setup_swap.sh          # Swap setup for Jetson Nano
-├── test_transcriber.py        # Comprehensive unit tests
-├── test_jetson.py             # Jetson-specific tests
-├── run_tests.py               # Simple test runner
-├── requirements.txt           # Python dependencies
-├── Dockerfile                 # Container configuration
-└── README.md                  # This file
+│   └── setup_swap.sh           # Swap setup for Jetson Nano
+├── test_transcriber.py         # Comprehensive unit tests
+├── test_jetson.py              # Jetson-specific tests
+├── run_tests.py                # Simple test runner
+├── requirements.txt            # Python dependencies
+├── Dockerfile                  # Container configuration
+├── ADAPTIVE_QUALITY_GUIDE.md   # Adaptive quality documentation
+└── README.md                   # This file
 ```
 
 ## 📊 Output Format
@@ -276,6 +358,26 @@ config = TranscriptionConfig(
 transcriber = Transcriber("medium", enable_diarization=True)
 ```
 
+### Adaptive Quality Configuration
+
+```python
+from adaptive_transcriber import AdaptiveTranscriber, QualityThresholds
+
+# Create custom quality thresholds
+thresholds = QualityThresholds(
+    quality_threshold=0.25,          # More strict quality requirement
+    avg_logprob_threshold=-1.0,      # Stricter confidence requirement
+    no_speech_prob_threshold=0.3,    # Less tolerance for false speech
+    compression_ratio_threshold=2.5  # Less tolerance for repetition
+)
+
+# Create adaptive transcriber
+transcriber = AdaptiveTranscriber(thresholds)
+
+# Transcribe with adaptive quality
+result = transcriber.transcribe_with_quality_check("audio.wav")
+```
+
 ### Programmatic Usage
 
 ```python
@@ -324,12 +426,20 @@ print(f"Processing time: {result.processing_time:.2f}s")
    - Consider using smaller models
    - Check GPU utilization
 
+6. **Adaptive Quality Issues**
+   - Check quality thresholds are appropriate for your use case
+   - Monitor logs for quality assessment decisions
+   - Verify larger models are available for retry
+   - Test with `test_quality_analysis.py` to understand quality metrics
+
 ### Logging
 
 Logs are stored in `~/.cache/whisper_trt/logs/` and include:
 - Audio processing details
 - GPU memory usage
 - Transcription results
+- Quality assessment decisions
+- Adaptive retry attempts
 - Error messages and warnings
 - System status information
 

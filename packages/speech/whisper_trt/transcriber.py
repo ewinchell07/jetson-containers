@@ -29,7 +29,8 @@ from contextlib import contextmanager
 
 from config import (
     get_transcribe_model, get_transcribe_prompt, select_model_with_fallback,
-    get_allow_swap, log_system_info, get_diarization_config, get_audio_config
+    get_allow_swap, log_system_info, get_diarization_config, get_audio_config,
+    get_quality_config
 )
 
 # Optional imports for diarization
@@ -55,9 +56,10 @@ class TranscriptionConfig:
     patience: float = 1.0
     no_speech_threshold: float = 0.7
     logprob_threshold: float = -1.0
-    compression_ratio: float = 2.6
+    compression_ratio: float = 2.0
     word_timestamps: bool = True
-    chunk_length: int = 30
+    noise_reduction: bool = True
+    chunk_length: int = 60
     chunk_overlap: int = 5
     vad_filter: bool = True
     language: str = "en"
@@ -157,6 +159,32 @@ class AudioProcessor:
             audio_tensor = audio_tensor.to(device)
         return audio_tensor
 
+    def chunk_audio(self, audio_data: np.ndarray, sample_rate: int, 
+                   chunk_length: int, chunk_overlap: int) -> List[Dict[str, Any]]:
+        """Break audio into overlapping chunks for processing"""
+        chunk_samples = chunk_length * sample_rate
+        overlap_samples = chunk_overlap * sample_rate
+        step_samples = chunk_samples - overlap_samples
+        
+        chunks = []
+        for start_sample in range(0, len(audio_data), step_samples):
+            end_sample = min(start_sample + chunk_samples, len(audio_data))
+            chunk_audio = audio_data[start_sample:end_sample]
+            
+            # Skip very short chunks (less than 1 second)
+            if len(chunk_audio) < sample_rate:
+                continue
+                
+            chunks.append({
+                "audio": chunk_audio,
+                "start_time": start_sample / sample_rate,
+                "end_time": end_sample / sample_rate,
+                "start_sample": start_sample,
+                "end_sample": end_sample
+            })
+        
+        return chunks
+
 
 class ModelManager:
     """Handles model loading and transcription"""
@@ -193,12 +221,15 @@ class ModelManager:
             raise
 
     def transcribe_audio(self, audio_file: str, config: TranscriptionConfig) -> Dict[str, Any]:
-        """Transcribe audio file with given configuration"""
+        """Transcribe audio file with given configuration using chunking"""
         try:
             # Load and preprocess audio
             logging.info(f"Loading audio: {audio_file}")
             audio_data, sample_rate = self.audio_processor.load_audio(audio_file)
-            audio_tensor = self.audio_processor.audio_to_tensor(audio_data, self.device)
+            
+            # Calculate audio duration
+            audio_duration = len(audio_data) / sample_rate
+            logging.info(f"Audio duration: {audio_duration:.2f} seconds")
             
             # Clean memory before transcription
             GPUManager.cleanup_memory()
@@ -207,11 +238,50 @@ class ModelManager:
             logging.info("Starting transcription...")
             start_time = datetime.now()
             
-            if isinstance(self.model, whisper.Whisper):
-                result = self._transcribe_with_whisper(audio_tensor, config)
+            # Check if we need to chunk the audio
+            if audio_duration <= config.chunk_length:
+                # Process as single chunk
+                logging.info("Processing as single chunk")
+                audio_tensor = self.audio_processor.audio_to_tensor(audio_data, self.device)
+                
+                if isinstance(self.model, whisper.Whisper):
+                    result = self._transcribe_with_whisper(audio_tensor, config)
+                else:
+                    # TRT model
+                    result = self.model.transcribe(audio_tensor)
             else:
-                # TRT model
-                result = self.model.transcribe(audio_tensor)
+                # Process in chunks
+                logging.info(f"Processing in chunks of {config.chunk_length}s with {config.chunk_overlap}s overlap")
+                chunks = self.audio_processor.chunk_audio(audio_data, sample_rate, 
+                                                        config.chunk_length, config.chunk_overlap)
+                logging.info(f"Created {len(chunks)} chunks for processing")
+                
+                chunk_results = []
+                for i, chunk in enumerate(chunks, 1):
+                    logging.info(f"Processing chunk {i}/{len(chunks)} ({chunk['start_time']:.2f}s - {chunk['end_time']:.2f}s)")
+                    
+                    # Convert chunk to tensor
+                    chunk_tensor = self.audio_processor.audio_to_tensor(chunk["audio"], self.device)
+                    
+                    # Transcribe chunk
+                    if isinstance(self.model, whisper.Whisper):
+                        chunk_result = self._transcribe_with_whisper(chunk_tensor, config)
+                    else:
+                        # TRT model
+                        chunk_result = self.model.transcribe(chunk_tensor)
+                    
+                    if chunk_result and chunk_result.get('text'):
+                        chunk_results.append(chunk_result)
+                        logging.info(f"Chunk {i} transcribed: {len(chunk_result['text'])} characters")
+                    else:
+                        logging.warning(f"Chunk {i} produced empty result")
+                    
+                    # Clean up memory between chunks
+                    GPUManager.cleanup_memory()
+                
+                # Merge chunk results
+                logging.info("Merging chunk results...")
+                result = self._merge_chunk_results(chunk_results, chunks)
             
             processing_time = (datetime.now() - start_time).total_seconds()
             
@@ -247,6 +317,44 @@ class ModelManager:
                     initial_prompt=config.initial_prompt,
                     word_timestamps=config.word_timestamps
                 )
+
+    def _merge_chunk_results(self, chunk_results: List[Dict[str, Any]], 
+                           chunks: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Merge transcription results from multiple chunks"""
+        if not chunk_results:
+            return {"text": "", "segments": []}
+        
+        # Merge text
+        full_text = " ".join([result.get("text", "") for result in chunk_results if result.get("text")])
+        
+        # Merge segments with proper time offsets
+        all_segments = []
+        for i, (result, chunk) in enumerate(zip(chunk_results, chunks)):
+            if not result.get("segments"):
+                continue
+                
+            chunk_start_time = chunk["start_time"]
+            for segment in result["segments"]:
+                # Adjust segment timestamps to global time
+                adjusted_segment = segment.copy()
+                adjusted_segment["start"] = segment["start"] + chunk_start_time
+                adjusted_segment["end"] = segment["end"] + chunk_start_time
+                
+                # Adjust word timestamps if they exist
+                if "words" in adjusted_segment:
+                    for word in adjusted_segment["words"]:
+                        word["start"] = word["start"] + chunk_start_time
+                        word["end"] = word["end"] + chunk_start_time
+                
+                all_segments.append(adjusted_segment)
+        
+        # Sort segments by start time
+        all_segments.sort(key=lambda x: x["start"])
+        
+        return {
+            "text": full_text,
+            "segments": all_segments
+        }
 
     def __del__(self):
         """Cleanup model resources"""
@@ -461,10 +569,20 @@ class SpeakerMerger:
 class Transcriber:
     """Main transcription processor with clean architecture"""
     
-    def __init__(self, model_name: str, hf_token: Optional[str] = None, enable_diarization: bool = True):
+    def __init__(self, model_name: str, hf_token: Optional[str] = None, enable_diarization: bool = True,
+                 use_adaptive_quality: bool = None):
         self.model_manager = ModelManager(model_name)
         self.diarization_manager = None
         self.speaker_merger = SpeakerMerger()
+        
+        # Load quality configuration
+        self.quality_config = get_quality_config()
+        
+        # Determine if adaptive quality should be used
+        if use_adaptive_quality is None:
+            self.use_adaptive_quality = self.quality_config['enable_quality_retry']
+        else:
+            self.use_adaptive_quality = use_adaptive_quality
         
         if enable_diarization and DIARIZATION_AVAILABLE:
             try:
@@ -476,6 +594,25 @@ class Transcriber:
         elif enable_diarization and not DIARIZATION_AVAILABLE:
             logging.warning("Diarization requested but Resemblyzer is not available")
         
+        # Initialize adaptive transcriber if enabled
+        if self.use_adaptive_quality:
+            try:
+                from adaptive_transcriber import AdaptiveTranscriber, QualityThresholds
+                thresholds = QualityThresholds(
+                    quality_threshold=self.quality_config['quality_threshold'],
+                    avg_logprob_threshold=self.quality_config['avg_logprob_threshold'],
+                    no_speech_prob_threshold=self.quality_config['no_speech_prob_threshold'],
+                    compression_ratio_threshold=self.quality_config['compression_ratio_threshold']
+                )
+                self.adaptive_transcriber = AdaptiveTranscriber(thresholds)
+                logging.info("Adaptive quality transcriber initialized")
+            except Exception as e:
+                logging.warning(f"Failed to initialize adaptive transcriber: {e}")
+                self.use_adaptive_quality = False
+        else:
+            self.adaptive_transcriber = None
+        
+        logging.info(f"Adaptive quality enabled: {self.use_adaptive_quality}")
         self._setup_logging()
 
     def _setup_logging(self) -> None:
@@ -518,8 +655,21 @@ class Transcriber:
                 initial_prompt=get_transcribe_prompt()
             )
             
-            # Transcribe
-            result = self.model_manager.transcribe_audio(audio_file, config)
+            # Transcribe with adaptive quality if enabled
+            if self.use_adaptive_quality and self.adaptive_transcriber:
+                logging.info("Using adaptive quality transcription")
+                result = self.adaptive_transcriber.transcribe_with_quality_check(audio_file, self.model_manager.model_name)
+                # Convert TranscriptionResult to dict format for diarization
+                result_dict = {
+                    'text': result.text,
+                    'segments': result.segments,
+                    'processing_time': result.processing_time,
+                    'gpu_memory_used': result.gpu_memory_used
+                }
+            else:
+                logging.info("Using standard transcription")
+                result = self.model_manager.transcribe_audio(audio_file, config)
+                result_dict = result
             
             # Add diarization if available
             speaker_segments = []
@@ -527,21 +677,29 @@ class Transcriber:
             if self.diarization_manager:
                 raw_speaker_segments = self.diarization_manager.process_audio(audio_file, num_speakers)
                 speaker_segments = self.speaker_merger.deduplicate_speaker_segments(raw_speaker_segments)
-                merged_segments = self.speaker_merger.merge_transcription_with_speakers(result, speaker_segments)
-                logging.info(f"Merged {len(result.get('segments', []))} transcription segments with {len(speaker_segments)} speaker segments")
+                merged_segments = self.speaker_merger.merge_transcription_with_speakers(result_dict, speaker_segments)
+                logging.info(f"Merged {len(result_dict.get('segments', []))} transcription segments with {len(speaker_segments)} speaker segments")
             
             # Create structured result
-            transcription_result = TranscriptionResult(
-                text=result.get('text', ''),
-                segments=result.get('segments', []),
-                speaker_segments=speaker_segments,
-                merged_segments=merged_segments,
-                model_name=self.model_manager.model_name,
-                processing_time=result.get('processing_time', 0.0),
-                gpu_memory_used=GPUManager.get_memory_usage(),
-                timestamp=datetime.now().isoformat(),
-                audio_file=str(audio_path.absolute())
-            )
+            if self.use_adaptive_quality and self.adaptive_transcriber:
+                # Use the TranscriptionResult from adaptive transcriber
+                transcription_result = result
+                # Update with diarization data
+                transcription_result.speaker_segments = speaker_segments
+                transcription_result.merged_segments = merged_segments
+            else:
+                # Create new TranscriptionResult from dict
+                transcription_result = TranscriptionResult(
+                    text=result_dict.get('text', ''),
+                    segments=result_dict.get('segments', []),
+                    speaker_segments=speaker_segments,
+                    merged_segments=merged_segments,
+                    model_name=self.model_manager.model_name,
+                    processing_time=result_dict.get('processing_time', 0.0),
+                    gpu_memory_used=GPUManager.get_memory_usage(),
+                    timestamp=datetime.now().isoformat(),
+                    audio_file=str(audio_path.absolute())
+                )
             
             # Save results
             self._save_results(transcription_result, output_file)

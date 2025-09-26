@@ -22,3 +22,7 @@ benchmark.csv
 # Recording directories
 packages/speech/whisper_trt/recordings/
 packages/speech/whisperx/recordings/
+
+# Transcription directories
+packages/speech/whisper_trt/transcriptions/
+packages/speech/whisperx/transcriptions/

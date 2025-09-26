@@ -15,12 +15,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_TRANSCRIBE_MODEL = "small"
 DEFAULT_ALLOW_SWAP = True
 DEFAULT_MAX_DURATION_MIN = None
-DEFAULT_TRANSCRIBE_PROMPT = (
-    "Primary task: transcribe only close-mic parent and child speech. "
-    "Ignore all TV, radio, sports commentary, songs from speakers, or other background audio. "
-    "Do not transcribe repeated filler words or background noise. "
-    "Use concise sentences and add minimal punctuation for readability."
-)
+DEFAULT_TRANSCRIBE_PROMPT = ("")
 
 # Diarization configuration defaults
 DEFAULT_DIARIZATION_CONFIG = {
@@ -34,6 +29,23 @@ DEFAULT_DIARIZATION_CONFIG = {
 # Audio configuration defaults
 DEFAULT_AUDIO_CONFIG = {
     "target_sample_rate": 16000     # Whisper expects 16kHz
+}
+
+# Adaptive quality configuration defaults
+# Optimized for normal audio conditions (20250916 baseline)
+DEFAULT_QUALITY_CONFIG = {
+    "enable_quality_retry": True,
+    "quality_threshold": 0.35,          # 0.0 = perfect, 1.0 = terrible (more lenient for normal audio)
+    "max_quality_retries": 2,           # Maximum retries with larger models
+    "avg_logprob_threshold": -1.0,      # Below this = low confidence (stricter confidence requirement)
+    "no_speech_prob_threshold": 0.35,   # Above this = too much false speech (more lenient for normal audio)
+    "compression_ratio_threshold": 4.0, # Above this = too repetitive (more lenient for normal audio)
+    "min_segments_per_minute": 2.0,     # Below this = too fragmented
+    "max_segments_per_minute": 20.0,    # Above this = over-segmented
+    "logprob_weight": 0.4,              # Weight for log probability scoring
+    "no_speech_weight": 0.3,            # Weight for no-speech scoring
+    "compression_weight": 0.2,          # Weight for compression scoring
+    "fragmentation_weight": 0.1         # Weight for fragmentation scoring
 }
 
 # Model requirements (minimum swap size in GB)
@@ -281,11 +293,49 @@ def get_model_swap_requirements(model: str) -> int:
     return MODEL_SWAP_REQUIREMENTS.get(model.lower(), 0)
 
 
+def get_quality_config() -> dict:
+    """
+    Get adaptive quality configuration from environment variables.
+    
+    Returns:
+        Dictionary with quality configuration settings
+    """
+    config = DEFAULT_QUALITY_CONFIG.copy()
+    
+    # Override with environment variables
+    if os.getenv('ENABLE_QUALITY_RETRY') is not None:
+        config['enable_quality_retry'] = os.getenv('ENABLE_QUALITY_RETRY', 'true').lower() == 'true'
+    
+    if os.getenv('QUALITY_THRESHOLD') is not None:
+        config['quality_threshold'] = float(os.getenv('QUALITY_THRESHOLD', '0.3'))
+    
+    if os.getenv('MAX_QUALITY_RETRIES') is not None:
+        config['max_quality_retries'] = int(os.getenv('MAX_QUALITY_RETRIES', '2'))
+    
+    if os.getenv('AVG_LOGPROB_THRESHOLD') is not None:
+        config['avg_logprob_threshold'] = float(os.getenv('AVG_LOGPROB_THRESHOLD', '-1.2'))
+    
+    if os.getenv('NO_SPEECH_PROB_THRESHOLD') is not None:
+        config['no_speech_prob_threshold'] = float(os.getenv('NO_SPEECH_PROB_THRESHOLD', '0.4'))
+    
+    if os.getenv('COMPRESSION_RATIO_THRESHOLD') is not None:
+        config['compression_ratio_threshold'] = float(os.getenv('COMPRESSION_RATIO_THRESHOLD', '3.0'))
+    
+    return config
+
+
 def log_system_info():
     """Log system information for debugging."""
     logger.info("=== System Information ===")
     logger.info(f"Jetson Nano: {is_jetson_nano()}")
     logger.info(f"Swap size: {get_swap_size_gb():.1f}GB")
+    
+    # Log quality configuration
+    quality_config = get_quality_config()
+    logger.info("=== Quality Configuration ===")
+    logger.info(f"Quality retry enabled: {quality_config['enable_quality_retry']}")
+    logger.info(f"Quality threshold: {quality_config['quality_threshold']}")
+    logger.info(f"Max quality retries: {quality_config['max_quality_retries']}")
     logger.info(f"Allow swap: {get_allow_swap()}")
     logger.info(f"Requested model: {get_transcribe_model()}")
     logger.info(f"Selected model: {select_model_with_fallback(get_transcribe_model(), get_allow_swap())}")

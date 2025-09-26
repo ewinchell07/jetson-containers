@@ -1,0 +1,125 @@
+# Adaptive Quality Configuration for Whisper Transcription
+# This file contains sane defaults for adaptive quality-based model selection
+
+# Quality Assessment Thresholds
+quality:
+  # Overall quality threshold (0.0 = perfect, 1.0 = terrible)
+  # Below this threshold, transcripts are considered acceptable
+  threshold: 0.3
+  
+  # Maximum number of retries with larger models
+  max_retries: 2
+  
+  # Individual metric thresholds
+  metrics:
+    # Average log probability (confidence) - below this = low confidence
+    avg_logprob_threshold: -1.2
+    
+    # No speech probability - above this = too much false speech detection
+    no_speech_prob_threshold: 0.4
+    
+    # Compression ratio - above this = too repetitive
+    compression_ratio_threshold: 3.0
+    
+    # Segment fragmentation
+    min_segments_per_minute: 2.0    # Below this = too fragmented
+    max_segments_per_minute: 20.0   # Above this = over-segmented
+  
+  # Scoring weights (must sum to 1.0)
+  weights:
+    logprob: 0.4        # 40% weight on confidence
+    no_speech: 0.3      # 30% weight on false speech
+    compression: 0.2    # 20% weight on repetition
+    fragmentation: 0.1  # 10% weight on fragmentation
+
+# Model Selection Strategy
+models:
+  # Model tiers in order of increasing quality and resource usage
+  tiers:
+    - name: "fast"
+      models: ["tiny", "base"]
+      description: "Fast but less accurate"
+    
+    - name: "balanced"
+      models: ["small", "small.en"]
+      description: "Good balance of speed and accuracy"
+    
+    - name: "accurate"
+      models: ["medium", "medium.en"]
+      description: "More accurate, slower"
+    
+    - name: "premium"
+      models: ["large-v2", "large-v3"]
+      description: "Most accurate, slowest"
+  
+  # Preferred model selection within tiers
+  preferences:
+    prefer_english_models: true    # Prefer .en models for English content
+    fallback_strategy: "next_tier" # How to handle tier selection
+
+# Reprocessing Configuration
+reprocessing:
+  # Quality thresholds for reprocessing existing transcripts
+  quality_threshold: 0.3          # Only reprocess if quality is below this
+  
+  # Minimum improvement required to save new transcript
+  min_improvement: 0.1            # Must improve by at least this amount
+  
+  # Output settings
+  output_directory: "reprocessed" # Directory for improved transcripts
+  backup_originals: true          # Keep original transcripts
+  
+  # Batch processing
+  batch_size: 10                  # Process this many files at once
+  parallel_processing: false      # Enable parallel processing (experimental)
+
+# Environment Variables (for reference)
+# These can be set to override the configuration:
+# 
+# ENABLE_QUALITY_RETRY=true
+# QUALITY_THRESHOLD=0.3
+# MAX_QUALITY_RETRIES=2
+# AVG_LOGPROB_THRESHOLD=-1.2
+# NO_SPEECH_PROB_THRESHOLD=0.4
+# COMPRESSION_RATIO_THRESHOLD=3.0
+
+# Recommended Settings for Different Use Cases
+
+# For High-Quality Requirements (slower, more accurate)
+high_quality:
+  quality_threshold: 0.2
+  max_retries: 3
+  min_improvement: 0.05
+  metrics:
+    avg_logprob_threshold: -1.0
+    no_speech_prob_threshold: 0.3
+    compression_ratio_threshold: 2.5
+
+# For Fast Processing (faster, less strict)
+fast_processing:
+  quality_threshold: 0.4
+  max_retries: 1
+  min_improvement: 0.15
+  metrics:
+    avg_logprob_threshold: -1.5
+    no_speech_prob_threshold: 0.5
+    compression_ratio_threshold: 4.0
+
+# For Your Specific Case (based on your analysis)
+# Your transcripts showed significant quality degradation after gain increase
+recommended_for_gain_issues:
+  quality_threshold: 0.25         # More strict due to gain issues
+  max_retries: 2
+  min_improvement: 0.1
+  metrics:
+    avg_logprob_threshold: -1.0   # Stricter confidence requirement
+    no_speech_prob_threshold: 0.3  # Less tolerance for false speech
+    compression_ratio_threshold: 2.5 # Less tolerance for repetition
+  weights:
+    no_speech: 0.4               # Higher weight on false speech detection
+    compression: 0.3              # Higher weight on repetition detection
+    logprob: 0.2
+    fragmentation: 0.1
+
+
+

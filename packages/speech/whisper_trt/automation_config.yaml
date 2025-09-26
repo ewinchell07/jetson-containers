@@ -1,0 +1,39 @@
+# Automation Manager Configuration
+# This file configures the automated recording and transcription system
+# 
+# IMPORTANT: All times are in LOCAL timezone (not UTC)
+# Recording filenames and timestamps also use local time for consistency
+
+# Recording Schedule (LOCAL TIME)
+recording_start_time: "06:30"    # Start recording at 6:30 AM local time
+recording_end_time: "20:00"      # Stop recording at 8:00 PM local time
+chunk_duration: 600              # 10 minutes per recording chunk
+
+# Recording Settings
+output_dir: "~/recordings"       # Directory to save recordings
+sample_rate: 16000              # Audio sample rate (16kHz for Whisper)
+buffer_size: 4096               # Audio buffer size (increase if getting overflows)
+latency: "high"                 # Audio latency mode (high for stability)
+amplify: true                   # Enable audio amplification
+gain: 1.5                       # Audio gain boost (1.0 = no change, 2.0 = double)
+normalize: true                 # Normalize audio to prevent clipping
+
+# Transcription Settings
+transcription_model: "small"     # Whisper model (small for efficiency)
+num_speakers: 3                 # Number of speakers for diarization
+transcription_output_dir: "~/transcriptions"  # Directory for transcriptions
+transcription_start_time: "20:00"  # Start transcription at 8:00 PM local time
+
+# Health Monitoring
+health_check_interval: 300      # Check recording health every 5 minutes
+max_missing_chunks: 2           # Restart recorder if 2+ chunks missing
+restart_delay: 30               # Wait 30 seconds before restarting
+
+# Logging
+log_level: "INFO"               # Log level (DEBUG, INFO, WARNING, ERROR)
+log_retention_days: 30          # Keep logs for 30 days
+
+# Container Settings
+container_name: "whisper-trt"
+use_container: true             # Set to true to run recording/transcription in Docker container
+
