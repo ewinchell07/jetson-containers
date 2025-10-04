@@ -10,7 +10,7 @@ recording_end_time: "20:00"      # Stop recording at 8:00 PM local time
 chunk_duration: 600              # 10 minutes per recording chunk
 
 # Recording Settings
-output_dir: "~/recordings"       # Directory to save recordings
+output_dir: "./recordings"       # Base directory to save recordings
 sample_rate: 16000              # Audio sample rate (16kHz for Whisper)
 buffer_size: 4096               # Audio buffer size (increase if getting overflows)
 latency: "high"                 # Audio latency mode (high for stability)
@@ -18,11 +18,33 @@ amplify: true                   # Enable audio amplification
 gain: 1.5                       # Audio gain boost (1.0 = no change, 2.0 = double)
 normalize: true                 # Normalize audio to prevent clipping
 
+# Multi-Channel Recording Settings
+channels: 4                     # Number of audio channels (4 for Focusrite 4i4)
+save_combined: false            # Save combined multi-channel file
+save_individual: true           # Save individual channel files (default)
+channel_names: ["ch1", "ch2", "ch3", "ch4"]  # Names for each channel
+apply_gain_to_channels: [2, 3]  # Channel indices to apply gain to (0-indexed: channels 3,4)
+format: "auto"                  # Audio format (auto, float32, int16, S32_LE)
+
+# Daily Directory Settings
+use_daily_directories: true     # Create new directory each day (YYYY-MM-DD format)
+daily_dir_format: "%Y-%m-%d"    # Date format for daily directories
+
 # Transcription Settings
 transcription_model: "small"     # Whisper model (small for efficiency)
 num_speakers: 3                 # Number of speakers for diarization
-transcription_output_dir: "~/transcriptions"  # Directory for transcriptions
+transcription_output_dir: "./transcriptions"  # Base directory for transcriptions
 transcription_start_time: "20:00"  # Start transcription at 8:00 PM local time
+
+# Adaptive Transcription Settings
+use_adaptive_transcription: true # Enable adaptive quality-based model selection
+quality_threshold: 0.3          # Quality threshold for adaptive retry (0.0=perfect, 1.0=terrible)
+max_quality_retries: 2          # Maximum retries with larger models
+enable_large_models: false       # Allow large models for adaptive transcription (requires more resources)
+
+# Recording Date Filter
+transcribe_from_date: "2025-10-02"  # Only transcribe recordings from this date onwards (YYYY-MM-DD format)
+# Set to null or empty to transcribe all recordings regardless of date
 
 # Health Monitoring
 health_check_interval: 300      # Check recording health every 5 minutes

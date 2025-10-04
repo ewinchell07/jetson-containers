@@ -69,7 +69,7 @@ class AutomationConfig:
     chunk_duration: int = 600            # 10 minutes in seconds
     
     # Recording settings
-    output_dir: str = "~/recordings"
+    output_dir: str = "~/recordings"     # Base directory for recordings
     sample_rate: int = 16000
     buffer_size: int = 4096
     latency: str = "high"
@@ -77,11 +77,32 @@ class AutomationConfig:
     gain: float = 1.5
     normalize: bool = True
     
+    # Multi-channel recording settings
+    channels: int = 4                    # Number of audio channels (4 for Focusrite 4i4)
+    save_combined: bool = False         # Save combined multi-channel file
+    save_individual: bool = True         # Save individual channel files (default)
+    channel_names: List[str] = None      # Names for each channel
+    apply_gain_to_channels: List[int] = None  # Channel indices to apply gain to (0-indexed)
+    format: str = "auto"                # Audio format (auto, float32, int16, S32_LE)
+    
+    # Daily directory settings
+    use_daily_directories: bool = True   # Create new directory each day
+    daily_dir_format: str = "%Y-%m-%d"   # Date format for daily directories
+    
     # Transcription settings
     transcription_model: str = "small"   # Use small model for efficiency
     num_speakers: int = 3               # 3 speakers as specified
-    transcription_output_dir: str = "~/transcriptions"
+    transcription_output_dir: str = "~/transcriptions"  # Base directory for transcriptions
     transcription_start_time: str = "20:00"  # 8:00 PM local time
+    
+    # Adaptive transcription settings
+    use_adaptive_transcription: bool = True  # Enable adaptive quality-based model selection
+    quality_threshold: float = 0.3       # Quality threshold for adaptive retry
+    max_quality_retries: int = 2        # Maximum retries with larger models
+    enable_large_models: bool = False   # Allow large models for adaptive transcription
+    
+    # Recording date filter
+    transcribe_from_date: Optional[str] = None  # Only transcribe recordings from this date onwards (YYYY-MM-DD)
     
     # Health monitoring
     health_check_interval: int = 300     # 5 minutes
@@ -131,18 +152,41 @@ class HealthMonitor:
     def get_recorded_chunks(self) -> List[datetime]:
         """Get list of actually recorded chunks for today (using local time)"""
         today = datetime.now().strftime("%Y%m%d")  # Local date
-        pattern = f"recording_{today}_*.wav"
+        
+        # Look for both combined files and individual channel files
+        patterns = [
+            f"recording_{today}_*.wav",  # Combined multi-channel files
+            f"recording_{today}_*_ch*.wav",  # Individual channel files
+            f"recording_{today}_*_*.wav"  # Any recording files with channel names
+        ]
         
         recorded_chunks = []
-        for file_path in self.output_dir.glob(pattern):
-            try:
-                # Extract timestamp from filename
-                filename = file_path.stem
-                timestamp_str = filename.replace("recording_", "").replace("_partial", "")
-                chunk_time = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
-                recorded_chunks.append(chunk_time)
-            except ValueError:
-                continue
+        seen_timestamps = set()
+        
+        for pattern in patterns:
+            for file_path in self.output_dir.glob(pattern):
+                try:
+                    # Extract timestamp from filename
+                    filename = file_path.stem
+                    # Remove channel suffixes like _ch1, _ch2, etc.
+                    timestamp_str = filename.replace("recording_", "").replace("_partial", "")
+                    
+                    # Remove channel suffixes (e.g., _ch1, _ch2, _ch3, _ch4)
+                    for suffix in ["_ch1", "_ch2", "_ch3", "_ch4", "_ch5", "_ch6", "_ch7", "_ch8"]:
+                        if timestamp_str.endswith(suffix):
+                            timestamp_str = timestamp_str[:-len(suffix)]
+                            break
+                    
+                    # Parse timestamp
+                    chunk_time = datetime.strptime(timestamp_str, "%Y%m%d_%H%M%S")
+                    
+                    # Only add if we haven't seen this timestamp before
+                    if chunk_time not in seen_timestamps:
+                        recorded_chunks.append(chunk_time)
+                        seen_timestamps.add(chunk_time)
+                        
+                except ValueError:
+                    continue
         
         return sorted(recorded_chunks)
     
@@ -189,8 +233,9 @@ class RecordingManager:
         self.recorder = None
         self.recording_thread = None
         self.is_recording = False
-        self.output_dir = Path(config.output_dir).expanduser()
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.base_output_dir = Path(config.output_dir).expanduser()
+        self.base_output_dir.mkdir(parents=True, exist_ok=True)
+        self.output_dir = self._get_daily_output_dir()
         
         # Setup audio config (only for direct mode)
         if HAS_WHISPER_MODULES:
@@ -201,7 +246,12 @@ class RecordingManager:
                 latency=config.latency,
                 enable_amplification=config.amplify,
                 normalize_audio=config.normalize,
-                gain_boost=config.gain
+                gain_boost=config.gain,
+                channels=config.channels,
+                save_combined=config.save_combined,
+                save_individual=config.save_individual,
+                channel_names=config.channel_names,
+                apply_gain_to_channels=config.apply_gain_to_channels
             )
         else:
             self.audio_config = None
@@ -209,6 +259,16 @@ class RecordingManager:
         # Container management
         self.container_name = config.container_name
         self.use_container = config.use_container
+    
+    def _get_daily_output_dir(self) -> Path:
+        """Get the daily output directory for recordings"""
+        if self.config.use_daily_directories:
+            today = datetime.now().strftime(self.config.daily_dir_format)
+            daily_dir = self.base_output_dir / today
+            daily_dir.mkdir(parents=True, exist_ok=True)
+            return daily_dir
+        else:
+            return self.base_output_dir
         
     def start_recording(self) -> bool:
         """Start recording in a separate thread"""
@@ -270,18 +330,36 @@ class RecordingManager:
                 self._start_container()
                 time.sleep(5)  # Give container time to start
             
+            # Get daily output directory for container
+            daily_output_dir = self._get_daily_output_dir()
+            container_output_dir = f"/opt/whisper_trt/recordings/{daily_output_dir.name}" if self.config.use_daily_directories else "/opt/whisper_trt/recordings"
+            
             # Start recording inside container
             cmd = [
                 "docker", "exec", "-d", self.container_name,
                 "python3", "/opt/whisper_trt/continuous_recorder.py",
                 "--chunk-duration", str(self.config.chunk_duration),
                 "--sample-rate", str(self.config.sample_rate),
-                "--output-dir", "/opt/whisper_trt/recordings",
+                "--output-dir", container_output_dir,
                 "--buffer-size", str(self.config.buffer_size),
                 "--latency", self.config.latency,
-                "--gain", str(self.config.gain)
+                "--gain", str(self.config.gain),
+                "--channels", str(self.config.channels)
             ]
             
+            # Add multi-channel specific options
+            if self.config.save_combined:
+                cmd.append("--save-combined")
+            if not self.config.save_individual:
+                cmd.append("--no-save-individual")
+            if self.config.channel_names:
+                cmd.extend(["--channel-names"] + self.config.channel_names)
+            if self.config.apply_gain_to_channels:
+                cmd.extend(["--apply-gain-to"] + [str(ch) for ch in self.config.apply_gain_to_channels])
+            if self.config.format != "auto":
+                cmd.extend(["--format", self.config.format])
+            
+            # Add amplification options
             if not self.config.amplify:
                 cmd.append("--no-amplify")
             if not self.config.normalize:
@@ -342,40 +420,66 @@ class RecordingManager:
             return False
     
     def _start_container(self):
-        """Start the Docker container"""
+        """Start the Docker container with proper configuration from README"""
         try:
-            # Check if container exists
-            cmd = ["docker", "ps", "-a", "--filter", f"name={self.container_name}", "--format", "{{.Names}}"]
+            # Check if container exists and is running
+            cmd = ["docker", "ps", "-q", "--filter", f"name={self.container_name}"]
             result = subprocess.run(cmd, capture_output=True, text=True)
             
-            if self.container_name in result.stdout:
-                # Container exists, start it
-                cmd = ["docker", "start", self.container_name]
-                subprocess.run(cmd, capture_output=True, text=True)
-                logging.info(f"Started existing container: {self.container_name}")
+            if result.stdout.strip():
+                logging.info(f"Container {self.container_name} is already running")
+                return True
+            
+            # Check if container exists but is stopped
+            cmd = ["docker", "ps", "-a", "-q", "--filter", f"name={self.container_name}"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.stdout.strip():
+                # Remove existing container first
+                logging.info(f"Removing existing container {self.container_name}")
+                subprocess.run(["docker", "rm", "-f", self.container_name], capture_output=True)
+            
+            # Create new container with proper configuration from README
+            logging.info(f"Creating new container {self.container_name}")
+            cmd = [
+                "docker", "run", "-d",
+                "--gpus", "all",
+                "--network=host",
+                "--device", "/dev/snd",
+                "--memory=6g",
+                "--shm-size=2g",
+                "--ulimit", "memlock=-1",
+                "--ulimit", "stack=67108864",
+                "-v", f"{Path.cwd()}:/opt/whisper_trt",
+                "-v", f"{Path.home()}/.cache/whisper_trt/logs:/root/.cache/whisper_trt/logs",
+                "-v", f"{self.base_output_dir}:/opt/whisper_trt/recordings",
+                "--name", self.container_name,
+                "whisper-trt:latest",
+                "bash", "-c", "sleep infinity"
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logging.error(f"Failed to create container: {result.stderr}")
+                return False
+            
+            # Wait for container to start
+            time.sleep(3)
+            
+            # Verify container is running
+            cmd = ["docker", "ps", "-q", "--filter", f"name={self.container_name}"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.stdout.strip():
+                logging.info(f"Container {self.container_name} started successfully")
+                return True
             else:
-                # Container doesn't exist, create and run it
-                cmd = [
-                    "docker", "run", "-d",
-                    "--gpus", "all",
-                    "--network=host",
-                    "--device", "/dev/snd",
-                    "--memory=6g",
-                    "--shm-size=2g",
-                    "--ulimit", "memlock=-1",
-                    "--ulimit", "stack=67108864",
-                    "-v", f"{Path.cwd()}:/opt/whisper_trt",
-                    "-v", f"{Path.home()}/.cache/whisper_trt/logs:/root/.cache/whisper_trt/logs",
-                    "-v", f"{self.output_dir}:/opt/whisper_trt/recordings",
-                    "--name", self.container_name,
-                    "whisper-trt:latest"
-                ]
-                subprocess.run(cmd, capture_output=True, text=True)
-                logging.info(f"Created and started new container: {self.container_name}")
+                logging.error(f"Container {self.container_name} failed to start")
+                return False
                 
         except Exception as e:
             logging.error(f"Error starting container: {e}")
-            raise
+            return False
     
     def restart_recording(self) -> bool:
         """Restart recording (stop and start)"""
@@ -390,18 +494,51 @@ class TranscriptionManager:
     
     def __init__(self, config: AutomationConfig):
         self.config = config
-        self.recordings_dir = Path(config.output_dir).expanduser()
-        self.transcriptions_dir = Path(config.transcription_output_dir).expanduser()
-        self.transcriptions_dir.mkdir(parents=True, exist_ok=True)
+        self.base_recordings_dir = Path(config.output_dir).expanduser()
+        self.base_transcriptions_dir = Path(config.transcription_output_dir).expanduser()
+        self.base_transcriptions_dir.mkdir(parents=True, exist_ok=True)
+        self.recordings_dir = self._get_daily_recordings_dir()
+        self.transcriptions_dir = self._get_daily_transcriptions_dir()
         
         # Container management
         self.container_name = config.container_name
         self.use_container = config.use_container
+    
+    def _get_daily_recordings_dir(self) -> Path:
+        """Get the daily recordings directory"""
+        if self.config.use_daily_directories:
+            today = datetime.now().strftime(self.config.daily_dir_format)
+            daily_dir = self.base_recordings_dir / today
+            try:
+                daily_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                # If we can't create the directory, try to use the base directory
+                logging.warning(f"Permission denied creating {daily_dir}, using base directory")
+                return self.base_recordings_dir
+            return daily_dir
+        else:
+            return self.base_recordings_dir
+    
+    def _get_daily_transcriptions_dir(self) -> Path:
+        """Get the daily transcriptions directory"""
+        if self.config.use_daily_directories:
+            today = datetime.now().strftime(self.config.daily_dir_format)
+            daily_dir = self.base_transcriptions_dir / today
+            try:
+                daily_dir.mkdir(parents=True, exist_ok=True)
+            except PermissionError:
+                # If we can't create the directory, try to use the base directory
+                logging.warning(f"Permission denied creating {daily_dir}, using base directory")
+                return self.base_transcriptions_dir
+            return daily_dir
+        else:
+            return self.base_transcriptions_dir
         
-        # Initialize transcriber with small model (only for direct mode)
+        # Initialize transcriber with adaptive quality if enabled
         if not self.use_container and HAS_WHISPER_MODULES:
             model = select_model_with_fallback(config.transcription_model, get_allow_swap())
-            self.transcriber = Transcriber(model, enable_diarization=True)
+            self.transcriber = Transcriber(model, enable_diarization=True, 
+                                         use_adaptive_quality=config.use_adaptive_transcription)
         else:
             self.transcriber = None
         
@@ -409,18 +546,129 @@ class TranscriptionManager:
         """Get list of recordings that haven't been transcribed yet"""
         unprocessed = []
         
-        # Get all recording files
-        recording_files = list(self.recordings_dir.glob("recording_*.wav"))
+        # Parse the date filter if specified
+        filter_date = None
+        if self.config.transcribe_from_date:
+            try:
+                filter_date = datetime.strptime(self.config.transcribe_from_date, "%Y-%m-%d").date()
+                logging.info(f"Only transcribing recordings from {filter_date} onwards")
+            except ValueError:
+                logging.warning(f"Invalid date format in transcribe_from_date: {self.config.transcribe_from_date}")
+        
+        # Get recording files from all daily directories from filter_date onwards
+        recording_files = self._get_all_recordings_from_date(filter_date)
         
         for recording_file in recording_files:
             # Check if transcription already exists
             base_name = recording_file.stem
-            transcription_file = self.transcriptions_dir / f"transcript_{base_name}.json"
+            
+            # For multi-channel files, we need to handle both combined and individual files
+            # For individual channel files (e.g., recording_20250127_143022_ch1.wav),
+            # we want to transcribe the combined file if it exists, or the first channel
+            if "_ch" in base_name:
+                # This is an individual channel file - check if we should transcribe it
+                # Only transcribe if it's the first channel (ch1) or if no combined file exists
+                if not base_name.endswith("_ch1"):
+                    # Skip non-first channels - we'll transcribe the combined file or ch1
+                    continue
+                
+                # Check if combined file exists (without _ch1 suffix)
+                combined_base = base_name.replace("_ch1", "")
+                combined_file = recording_file.parent / f"{combined_base}.wav"
+                if combined_file.exists():
+                    # Combined file exists, skip individual channel files
+                    continue
+                
+                # Use the individual channel file
+                transcription_base = base_name
+            else:
+                # This is a combined file or regular file
+                transcription_base = base_name
+            
+            transcription_file = self.transcriptions_dir / f"transcript_{transcription_base}.json"
             
             if not transcription_file.exists():
                 unprocessed.append(recording_file)
         
+        logging.info(f"Found {len(unprocessed)} unprocessed recordings to transcribe")
         return sorted(unprocessed)
+    
+    def _get_all_recordings_from_date(self, filter_date: Optional[datetime.date]) -> List[Path]:
+        """Get all recording files from daily directories from filter_date onwards"""
+        all_recordings = []
+        
+        if self.config.use_daily_directories:
+            # Scan all daily directories from filter_date onwards
+            base_dir = self.base_recordings_dir
+            
+            # Get all subdirectories that look like dates
+            for subdir in base_dir.iterdir():
+                if not subdir.is_dir():
+                    continue
+                
+                # Check if this directory should be included based on date filter
+                if filter_date is not None:
+                    if not self._is_directory_after_date(subdir, filter_date):
+                        continue
+                
+                # Look for recording files in this directory
+                # Include both combined files and individual channel files
+                recordings_in_dir = []
+                recordings_in_dir.extend(subdir.glob("recording_*.wav"))  # Combined files
+                recordings_in_dir.extend(subdir.glob("recording_*_ch*.wav"))  # Individual channel files
+                all_recordings.extend(recordings_in_dir)
+                if recordings_in_dir:
+                    logging.debug(f"Found {len(recordings_in_dir)} recordings in {subdir.name}")
+        else:
+            # Single directory mode - get all recording files
+            all_recordings = []
+            all_recordings.extend(self.recordings_dir.glob("recording_*.wav"))  # Combined files
+            all_recordings.extend(self.recordings_dir.glob("recording_*_ch*.wav"))  # Individual channel files
+        
+        return all_recordings
+    
+    def _is_directory_after_date(self, directory: Path, filter_date: datetime.date) -> bool:
+        """Check if a directory represents a date on or after the filter date"""
+        dir_name = directory.name
+        
+        # Try different date formats
+        date_formats = [
+            "%Y-%m-%d",      # 2025-09-29
+            "%Y%m%d",         # 20250929
+            "%Y-%m-%d_*",     # 2025-09-29_suffix
+        ]
+        
+        for date_format in date_formats:
+            try:
+                # Extract the date part (before any suffix)
+                date_part = dir_name.split('_')[0] if '_' in dir_name else dir_name
+                dir_date = datetime.strptime(date_part, date_format).date()
+                return dir_date >= filter_date
+            except ValueError:
+                continue
+        
+        # If we can't parse the date, include the directory (safer to include than exclude)
+        logging.debug(f"Could not parse date from directory name: {dir_name}")
+        return True
+    
+    def _is_recording_after_date(self, recording_file: Path, filter_date: datetime.date) -> bool:
+        """Check if a recording file is from or after the specified date"""
+        try:
+            # Extract date from filename (format: recording_YYYYMMDD_HHMMSS_*.wav)
+            filename = recording_file.stem
+            if filename.startswith("recording_"):
+                # Remove "recording_" prefix
+                date_part = filename[10:]  # Skip "recording_"
+                # Extract date part (first 8 characters: YYYYMMDD)
+                if len(date_part) >= 8:
+                    date_str = date_part[:8]
+                    file_date = datetime.strptime(date_str, "%Y%m%d").date()
+                    return file_date >= filter_date
+        except (ValueError, IndexError) as e:
+            logging.debug(f"Could not parse date from {recording_file.name}: {e}")
+        
+        # If we can't parse the date, include the file (safer to include than exclude)
+        return True
     
     def transcribe_recordings(self) -> Dict[str, Any]:
         """Transcribe all unprocessed recordings"""
@@ -483,23 +731,54 @@ class TranscriptionManager:
                 try:
                     logging.info(f"Transcribing {i}/{len(unprocessed)}: {recording_file.name}")
                     
-                    # Run transcription inside container
+                    # Get the actual directory where the recording file is located
+                    recording_file_path = recording_file.relative_to(self.base_recordings_dir)
+                    
+                    # Get daily transcriptions directory for output
+                    daily_transcriptions_dir = self._get_daily_transcriptions_dir()
+                    
+                    # Run transcription inside container with adaptive settings
                     cmd = [
                         "docker", "exec", self.container_name,
                         "python3", "/opt/whisper_trt/transcriber.py",
-                        f"/opt/whisper_trt/recordings/{recording_file.name}",
-                        "--model", self.config.transcription_model,
-                        "--output-dir", "/opt/whisper_trt/transcriptions",
+                        f"/opt/whisper_trt/recordings/{recording_file_path}",
+                        "--output-dir", f"/opt/whisper_trt/transcriptions/{daily_transcriptions_dir.name}" if self.config.use_daily_directories else "/opt/whisper_trt/transcriptions",
                         "--num-speakers", str(self.config.num_speakers)
                     ]
                     
+                    # Add adaptive transcription environment variables
+                    env_vars = {
+                        "ENABLE_QUALITY_RETRY": str(self.config.use_adaptive_transcription).lower(),
+                        "QUALITY_THRESHOLD": str(self.config.quality_threshold),
+                        "MAX_QUALITY_RETRIES": str(self.config.max_quality_retries),
+                        "ENABLE_LARGE_MODELS": str(self.config.enable_large_models).lower()
+                    }
+                    
+                    # Set environment variables in container
+                    for key, value in env_vars.items():
+                        subprocess.run([
+                            "docker", "exec", self.container_name,
+                            "sh", "-c", f"export {key}={value}"
+                        ], capture_output=True, text=True)
+                    
                     result = subprocess.run(cmd, capture_output=True, text=True)
+                    
+                    # Forward container output to systemd logs
+                    if result.stdout:
+                        for line in result.stdout.strip().split('\n'):
+                            if line.strip():
+                                logging.info(f"[TRANSCRIBER] {line}")
+                    
+                    if result.stderr:
+                        for line in result.stderr.strip().split('\n'):
+                            if line.strip():
+                                logging.error(f"[TRANSCRIBER] {line}")
                     
                     if result.returncode == 0:
                         processed += 1
                         logging.info(f"Transcribed: {recording_file.name}")
                     else:
-                        logging.error(f"Error transcribing {recording_file.name}: {result.stderr}")
+                        logging.error(f"Error transcribing {recording_file.name} (exit code: {result.returncode})")
                         errors += 1
                         
                 except Exception as e:
@@ -525,41 +804,67 @@ class TranscriptionManager:
             return False
     
     def _start_container(self):
-        """Start the Docker container"""
+        """Start the Docker container with proper configuration from README"""
         try:
-            # Check if container exists
-            cmd = ["docker", "ps", "-a", "--filter", f"name={self.container_name}", "--format", "{{.Names}}"]
+            # Check if container exists and is running
+            cmd = ["docker", "ps", "-q", "--filter", f"name={self.container_name}"]
             result = subprocess.run(cmd, capture_output=True, text=True)
             
-            if self.container_name in result.stdout:
-                # Container exists, start it
-                cmd = ["docker", "start", self.container_name]
-                subprocess.run(cmd, capture_output=True, text=True)
-                logging.info(f"Started existing container: {self.container_name}")
+            if result.stdout.strip():
+                logging.info(f"Container {self.container_name} is already running")
+                return True
+            
+            # Check if container exists but is stopped
+            cmd = ["docker", "ps", "-a", "-q", "--filter", f"name={self.container_name}"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.stdout.strip():
+                # Remove existing container first
+                logging.info(f"Removing existing container {self.container_name}")
+                subprocess.run(["docker", "rm", "-f", self.container_name], capture_output=True)
+            
+            # Create new container with proper configuration from README
+            logging.info(f"Creating new container {self.container_name}")
+            cmd = [
+                "docker", "run", "-d",
+                "--gpus", "all",
+                "--network=host",
+                "--device", "/dev/snd",
+                "--memory=6g",
+                "--shm-size=2g",
+                "--ulimit", "memlock=-1",
+                "--ulimit", "stack=67108864",
+                "-v", f"{Path.cwd()}:/opt/whisper_trt",
+                "-v", f"{Path.home()}/.cache/whisper_trt/logs:/root/.cache/whisper_trt/logs",
+                "-v", f"{self.base_recordings_dir}:/opt/whisper_trt/recordings",
+                "-v", f"{self.base_transcriptions_dir}:/opt/whisper_trt/transcriptions",
+                "--name", self.container_name,
+                "whisper-trt:latest",
+                "bash", "-c", "sleep infinity"
+            ]
+            
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                logging.error(f"Failed to create container: {result.stderr}")
+                return False
+            
+            # Wait for container to start
+            time.sleep(3)
+            
+            # Verify container is running
+            cmd = ["docker", "ps", "-q", "--filter", f"name={self.container_name}"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.stdout.strip():
+                logging.info(f"Container {self.container_name} started successfully")
+                return True
             else:
-                # Container doesn't exist, create and run it
-                cmd = [
-                    "docker", "run", "-d",
-                    "--gpus", "all",
-                    "--network=host",
-                    "--device", "/dev/snd",
-                    "--memory=6g",
-                    "--shm-size=2g",
-                    "--ulimit", "memlock=-1",
-                    "--ulimit", "stack=67108864",
-                    "-v", f"{Path.cwd()}:/opt/whisper_trt",
-                    "-v", f"{Path.home()}/.cache/whisper_trt/logs:/root/.cache/whisper_trt/logs",
-                    "-v", f"{self.recordings_dir}:/opt/whisper_trt/recordings",
-                    "-v", f"{self.transcriptions_dir}:/opt/whisper_trt/transcriptions",
-                    "--name", self.container_name,
-                    "whisper-trt:latest"
-                ]
-                subprocess.run(cmd, capture_output=True, text=True)
-                logging.info(f"Created and started new container: {self.container_name}")
+                logging.error(f"Container {self.container_name} failed to start")
+                return False
                 
         except Exception as e:
             logging.error(f"Error starting container: {e}")
-            raise
+            return False
 
 
 class AutomationManager:
@@ -586,20 +891,46 @@ class AutomationManager:
     def _setup_logging(self):
         """Setup logging configuration"""
         log_dir = Path.home() / ".cache" / "whisper_trt" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Try to create log directory with proper permissions
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            # Ensure the directory is writable
+            if not os.access(log_dir, os.W_OK):
+                raise PermissionError(f"Cannot write to {log_dir}")
+        except (PermissionError, OSError) as e:
+            # Fallback to a writable directory
+            log_dir = Path.cwd() / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            logging.warning(f"Using fallback log directory: {log_dir}")
         
         # Clean old logs
         self._cleanup_old_logs(log_dir)
         
         log_file = log_dir / f"automation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         
+        # Setup logging with error handling
+        handlers = []
+        
+        # Add file handler if we can write to the log file
+        try:
+            file_handler = logging.FileHandler(log_file)
+            handlers.append(file_handler)
+        except (PermissionError, OSError) as e:
+            logging.warning(f"Cannot create log file {log_file}: {e}")
+        
+        # Add console handler if not in daemon mode
+        if not self.daemon_mode:
+            handlers.append(logging.StreamHandler())
+        
+        # If no handlers available, use NullHandler
+        if not handlers:
+            handlers.append(logging.NullHandler())
+        
         logging.basicConfig(
             level=getattr(logging, self.config.log_level.upper()),
             format='%(asctime)s [%(levelname)s] %(name)s: %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler() if not self.daemon_mode else logging.NullHandler()
-            ]
+            handlers=handlers
         )
         
         logging.info(f"Automation manager logging to: {log_file}")
@@ -649,13 +980,83 @@ class AutomationManager:
     def _transcription_schedule(self):
         """Scheduled task to run transcription"""
         logging.info("Scheduled transcription start")
+        
+        # Forward recent container logs
+        self._forward_container_logs()
+        
+        # Ensure container is running before transcription
+        if not self._ensure_container_running():
+            logging.error("Failed to start container for transcription")
+            return
+        
         result = self.transcription_manager.transcribe_recordings()
         logging.info(f"Transcription result: {result}")
+    
+    def _ensure_container_running(self) -> bool:
+        """Ensure the Docker container is running, restart if needed"""
+        try:
+            # Check if container is running
+            cmd = ["docker", "ps", "-q", "--filter", f"name={self.config.container_name}"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.stdout.strip():
+                logging.debug(f"Container {self.config.container_name} is running")
+                return True
+            
+            # Container is not running, try to start it
+            logging.info(f"Container {self.config.container_name} is not running, attempting to start...")
+            
+            # Check if container exists but is stopped
+            cmd = ["docker", "ps", "-a", "-q", "--filter", f"name={self.config.container_name}"]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            
+            if result.stdout.strip():
+                # Start existing container
+                logging.info(f"Starting existing container {self.config.container_name}")
+                cmd = ["docker", "start", self.config.container_name]
+                result = subprocess.run(cmd, capture_output=True, text=True)
+                
+                if result.returncode == 0:
+                    time.sleep(3)  # Wait for container to start
+                    return True
+                else:
+                    logging.error(f"Failed to start existing container: {result.stderr}")
+            
+            # Container doesn't exist or failed to start, create new one
+            logging.info(f"Creating new container {self.config.container_name}")
+            return self.transcription_manager._start_container()
+            
+        except Exception as e:
+            logging.error(f"Error ensuring container is running: {e}")
+            return False
+    
+    def _forward_container_logs(self):
+        """Forward recent container logs to systemd logs"""
+        try:
+            # Get recent logs from container
+            cmd = ["docker", "logs", "--tail", "10", self.config.container_name]
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+            
+            if result.stdout:
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip():
+                        logging.info(f"[CONTAINER] {line}")
+            
+            if result.stderr:
+                for line in result.stderr.strip().split('\n'):
+                    if line.strip():
+                        logging.error(f"[CONTAINER] {line}")
+                        
+        except Exception as e:
+            logging.debug(f"Could not forward container logs: {e}")
     
     def _health_check_schedule(self):
         """Scheduled health check"""
         if not self.health_monitor.is_recording_time():
             return
+        
+        # Forward recent container logs
+        self._forward_container_logs()
         
         health_status = self.health_monitor.check_health()
         
@@ -748,15 +1149,27 @@ class AutomationManager:
 
 def load_config(config_file: Optional[str] = None) -> AutomationConfig:
     """Load configuration from file or use defaults"""
+    # If no config file specified, look for automation_config.yaml in current directory
+    if config_file is None:
+        default_config = "automation_config.yaml"
+        if Path(default_config).exists():
+            config_file = default_config
+            logging.info(f"Using default config file: {config_file}")
+    
     if config_file and Path(config_file).exists() and HAS_YAML:
         try:
             with open(config_file, 'r') as f:
                 config_data = yaml.safe_load(f)
+            logging.info(f"Loaded configuration from: {config_file}")
             return AutomationConfig(**config_data)
         except Exception as e:
             logging.warning(f"Error loading config file: {e}, using defaults")
             return AutomationConfig()
     else:
+        if config_file:
+            logging.warning(f"Config file not found: {config_file}, using defaults")
+        else:
+            logging.info("No config file specified, using defaults")
         return AutomationConfig()
 
 

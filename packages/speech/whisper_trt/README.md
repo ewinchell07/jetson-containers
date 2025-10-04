@@ -13,6 +13,10 @@ A robust, production-ready speech transcription system optimized for NVIDIA Jets
 - **Batch Processing**: Process single files or entire directories
 - **Audio Preprocessing**: Automatic noise suppression, filtering, and normalization
 - **Reprocessing Tools**: Reprocess existing transcripts with adaptive quality improvements
+- **Multi-Channel Recording**: 4-channel continuous recording optimized for Focusrite 4i4 and Rode microphones
+- **Channel Splitting**: Automatic splitting of multi-channel recordings into individual mono files
+- **Channel-Specific Processing**: Individual gain control and processing per channel
+- **S32_LE Format Support**: Native support for high-quality S32_LE audio format
 - **Jetson Optimized**: Specifically designed for Jetson Nano and other Jetson devices
 - **Comprehensive Testing**: Full test suite with Jetson-specific tests
 
@@ -163,17 +167,72 @@ python3 test_adaptive.py --audio-file audio.wav --verbose
 python3 test_adaptive.py --compare original.json improved.json
 ```
 
-### 4. Continuous Recording
+### 4. Multi-Channel Continuous Recording
 
 ```bash
-# Basic continuous recording
-python3 continuous_recorder.py --chunk-duration 600 --output-dir recordings
+# Record 4 Rode microphones with automatic channel splitting (default)
+python3 continuous_recorder.py --channels 4 --chunk-duration 600 --output-dir recordings
 
-# Optimized for stability
-python3 continuous_recorder.py --chunk-duration 600 --buffer-size 4096 --latency high
+# Record with custom channel names
+python3 continuous_recorder.py --channels 4 --channel-names "Host" "Guest" "Room" "Backup"
+
+# Save both combined and individual files
+python3 continuous_recorder.py --channels 4 --save-combined --save-individual
+
+# Record without channel splitting (single multi-channel file only)
+python3 continuous_recorder.py --channels 4 --no-save-individual
+
+# Apply gain only to channels 3 and 4 (default behavior)
+python3 continuous_recorder.py --channels 4 --apply-gain-to 2 3
+
+# Apply gain to all channels
+python3 continuous_recorder.py --channels 4 --apply-gain-to 0 1 2 3
+
+# Optimized for stability with 4 channels
+python3 continuous_recorder.py --channels 4 --chunk-duration 600 --buffer-size 4096 --latency high
+```
+
+### 5. Channel Splitting Tool
+
+```bash
+# Split existing 4-channel file into individual mono files
+python3 split_channels.py recording_4channel.wav
+
+# With custom output directory
+python3 split_channels.py recording_4channel.wav --output-dir ./split_audio
+
+# With custom channel names
+python3 split_channels.py recording_4channel.wav --channel-names mic1 mic2 mic3 mic4
+
+# With custom prefix for output files
+python3 split_channels.py recording_4channel.wav --prefix my_recording
+
+# Verbose output
+python3 split_channels.py recording_4channel.wav --verbose
+
+# This creates:
+# - recording_4channel_ch1.wav (Channel 1)
+# - recording_4channel_ch2.wav (Channel 2) 
+# - recording_4channel_ch3.wav (Channel 3)
+# - recording_4channel_ch4.wav (Channel 4)
+```
+
+### 6. Working with Focusrite 4i4
+
+```bash
+# Test 4-channel recording with arecord (S32_LE format)
+arecord -D plughw:0,0 -f S32_LE -r 48000 -c 4 -t wav -d 10 test_4channel.wav
+
+# Split the recording into individual channels
+python3 split_channels.py test_4channel.wav
+
+# The continuous recorder automatically detects Focusrite 4i4 and uses optimal settings
+python3 continuous_recorder.py --channels 4
 ```
 
 ### Command Line Options
+
+#### Transcription Options
 
 | Option | Description | Default |
 |--------|-------------|---------|
@@ -186,6 +245,37 @@ python3 continuous_recorder.py --chunk-duration 600 --buffer-size 4096 --latency
 | `--pattern` | File pattern for batch processing | `*.wav` |
 | `--quality-threshold` | Quality threshold for adaptive retry | `0.3` |
 | `--max-retries` | Maximum retries with larger models | `2` |
+
+#### Multi-Channel Recording Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--channels` | Number of audio channels to record | `4` |
+| `--chunk-duration` | Duration of each audio chunk in seconds | `600` |
+| `--sample-rate` | Audio sample rate | `16000` |
+| `--output-dir` | Output directory for recordings | `~/recordings` |
+| `--device` | Audio input device ID | Auto-detect |
+| `--buffer-size` | Audio buffer size | `4096` |
+| `--latency` | Audio latency mode (low/high) | `high` |
+| `--audio-format` | Audio format (int16/int32/float32) | `int16` |
+| `--save-combined` | Save combined multi-channel file | `False` |
+| `--save-individual` | Save individual channel files | `True` |
+| `--no-save-individual` | Disable saving individual files | `False` |
+| `--channel-names` | Names for each channel | Auto-generated |
+| `--apply-gain-to` | Channel indices to apply gain to (0-indexed) | `2 3` (channels 3,4) |
+| `--amplify` | Enable audio amplification | `True` |
+| `--gain` | Audio gain boost multiplier | `1.5` |
+| `--normalize` | Normalize audio to prevent clipping | `True` |
+
+#### Channel Splitting Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `input_file` | Multi-channel WAV file to split | Required |
+| `--output-dir` | Output directory for split files | Current directory |
+| `--channel-names` | Names for each channel | Auto-generated |
+| `--prefix` | Prefix for output filenames | Input filename |
+| `--verbose` | Enable verbose logging | `False` |
 
 ## 🧪 Testing
 
@@ -284,7 +374,8 @@ whisper_trt/
 ├── test_adaptive.py             # Adaptive quality testing
 ├── adaptive_config.yaml         # Quality configuration
 ├── config.py                    # Configuration management
-├── continuous_recorder.py       # Continuous audio recording
+├── continuous_recorder.py       # Multi-channel continuous audio recording
+├── split_channels.py            # Channel splitting utility (NEW)
 ├── audio/
 │   └── preprocess.py           # Audio preprocessing utilities
 ├── scripts/
@@ -295,6 +386,8 @@ whisper_trt/
 ├── requirements.txt            # Python dependencies
 ├── Dockerfile                  # Container configuration
 ├── ADAPTIVE_QUALITY_GUIDE.md   # Adaptive quality documentation
+├── MULTI_CHANNEL_RECORDING.md  # Multi-channel recording guide
+├── QUICK_REFERENCE.md          # Quick command reference
 └── README.md                   # This file
 ```
 
@@ -432,6 +525,30 @@ print(f"Processing time: {result.processing_time:.2f}s")
    - Verify larger models are available for retry
    - Test with `test_quality_analysis.py` to understand quality metrics
 
+7. **Multi-Channel Recording Issues**
+   - Verify audio device supports required channels
+   - Check ALSA device configuration (`arecord -l`)
+   - Use `plughw:0,0` for Focusrite 4i4 compatibility
+   - Ensure proper channel mapping (FL/FR/FC/LFE for Focusrite 4i4)
+   - Test with `arecord` command first
+   - Check that Focusrite 4i4 is detected automatically
+   - Verify S32_LE format compatibility
+
+8. **Silent Recordings**
+   - Check microphone input levels
+   - Verify channel mapping (FL/FR/FC/LFE for Focusrite 4i4)
+   - Test with `arecord` command first
+   - Check audio device permissions
+   - Use `python3 split_channels.py` to analyze channel levels
+   - Check channel-specific gain settings (channels 3,4 have gain by default)
+
+9. **Channel Splitting Issues**
+   - Verify input file is multi-channel (not mono)
+   - Check file format compatibility (S32_LE, WAV)
+   - Ensure output directory is writable
+   - Use `--verbose` flag for detailed processing information
+   - Test with a known good multi-channel file first
+
 ### Logging
 
 Logs are stored in `~/.cache/whisper_trt/logs/` and include:
@@ -450,6 +567,12 @@ Logs are stored in `~/.cache/whisper_trt/logs/` and include:
 3. Add tests for new functionality
 4. Ensure all tests pass
 5. Submit a pull request
+
+## 📚 Additional Documentation
+
+- **[Multi-Channel Recording Guide](MULTI_CHANNEL_RECORDING.md)**: Comprehensive guide for multi-channel audio recording
+- **[Quick Reference](QUICK_REFERENCE.md)**: Quick command reference and troubleshooting
+- **[Adaptive Quality Guide](ADAPTIVE_QUALITY_GUIDE.md)**: Advanced quality assessment features
 
 ## 📄 License
 

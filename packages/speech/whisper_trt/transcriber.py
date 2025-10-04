@@ -185,6 +185,157 @@ class AudioProcessor:
         
         return chunks
 
+    def analyze_audio_quality(self, audio_data: np.ndarray, sample_rate: int) -> Dict[str, Any]:
+        """Analyze audio quality and detect if it contains speech"""
+        try:
+            # Calculate basic audio statistics
+            duration = len(audio_data) / sample_rate
+            rms_energy = np.sqrt(np.mean(audio_data**2))
+            max_amplitude = np.max(np.abs(audio_data))
+            
+            # Calculate spectral characteristics
+            import librosa
+            spectral_centroids = librosa.feature.spectral_centroid(y=audio_data, sr=sample_rate)[0]
+            spectral_rolloff = librosa.feature.spectral_rolloff(y=audio_data, sr=sample_rate)[0]
+            zero_crossing_rate = librosa.feature.zero_crossing_rate(audio_data)[0]
+            
+            # Calculate speech-like characteristics
+            avg_spectral_centroid = np.mean(spectral_centroids)
+            avg_spectral_rolloff = np.mean(spectral_rolloff)
+            avg_zcr = np.mean(zero_crossing_rate)
+            
+            # Detect silence and low-energy segments
+            frame_length = int(0.025 * sample_rate)  # 25ms frames
+            hop_length = int(0.010 * sample_rate)   # 10ms hop
+            
+            # Calculate energy in each frame
+            energy_frames = []
+            for i in range(0, len(audio_data) - frame_length, hop_length):
+                frame = audio_data[i:i + frame_length]
+                energy = np.sum(frame**2)
+                energy_frames.append(energy)
+            
+            energy_frames = np.array(energy_frames)
+            energy_threshold = np.percentile(energy_frames, 20)  # Bottom 20% as silence threshold
+            
+            # Count speech vs silence frames
+            speech_frames = np.sum(energy_frames > energy_threshold)
+            total_frames = len(energy_frames)
+            speech_ratio = speech_frames / total_frames if total_frames > 0 else 0
+            
+            # Detect if audio is too quiet
+            is_quiet = rms_energy < 0.01  # Very low RMS energy
+            
+            # Detect if audio is too short
+            is_too_short = duration < 1.0  # Less than 1 second
+            
+            # Detect if audio has no dynamic range (likely silence or noise)
+            dynamic_range = np.max(audio_data) - np.min(audio_data)
+            has_no_dynamics = dynamic_range < 0.001
+            
+            # Speech detection heuristics
+            has_speech_characteristics = (
+                avg_spectral_centroid > 1000 and  # Speech typically has higher spectral centroid
+                avg_spectral_rolloff > 2000 and   # Speech has energy in higher frequencies
+                avg_zcr > 0.01 and                 # Speech has some zero crossings
+                speech_ratio > 0.1                 # At least 10% of frames have speech energy
+            )
+            
+            # Overall quality assessment
+            is_likely_speech = (
+                not is_quiet and 
+                not is_too_short and 
+                not has_no_dynamics and 
+                has_speech_characteristics
+            )
+            
+            # Confidence score (0-1)
+            confidence = 0.0
+            if is_likely_speech:
+                confidence = min(1.0, speech_ratio * 2)  # Scale by speech ratio
+            elif not is_quiet and not is_too_short:
+                confidence = speech_ratio  # Some confidence if not completely silent
+            
+            analysis_result = {
+                "duration_seconds": duration,
+                "rms_energy": float(rms_energy),
+                "max_amplitude": float(max_amplitude),
+                "dynamic_range": float(dynamic_range),
+                "speech_ratio": float(speech_ratio),
+                "avg_spectral_centroid": float(avg_spectral_centroid),
+                "avg_spectral_rolloff": float(avg_spectral_rolloff),
+                "avg_zero_crossing_rate": float(avg_zcr),
+                "is_quiet": is_quiet,
+                "is_too_short": is_too_short,
+                "has_no_dynamics": has_no_dynamics,
+                "has_speech_characteristics": has_speech_characteristics,
+                "is_likely_speech": is_likely_speech,
+                "confidence_score": float(confidence),
+                "recommendation": self._get_audio_recommendation(
+                    is_likely_speech, is_quiet, is_too_short, has_no_dynamics, confidence
+                )
+            }
+            
+            return analysis_result
+            
+        except Exception as e:
+            logging.error(f"Audio analysis error: {e}")
+            return {
+                "duration_seconds": 0,
+                "is_likely_speech": False,
+                "confidence_score": 0.0,
+                "recommendation": "Analysis failed",
+                "error": str(e)
+            }
+
+    def _get_audio_recommendation(self, is_likely_speech: bool, is_quiet: bool, 
+                                is_too_short: bool, has_no_dynamics: bool, 
+                                confidence: float) -> str:
+        """Get recommendation based on audio analysis"""
+        if is_too_short:
+            return "SKIP - Audio too short (< 1 second)"
+        elif is_quiet:
+            return "SKIP - Audio too quiet (likely silence)"
+        elif has_no_dynamics:
+            return "SKIP - No dynamic range (likely silence or noise)"
+        elif confidence < 0.1:
+            return "SKIP - Very low speech confidence"
+        elif confidence < 0.3:
+            return "WARN - Low speech confidence, may be mostly silence"
+        elif confidence < 0.6:
+            return "PROCEED - Moderate speech confidence"
+        else:
+            return "PROCEED - High speech confidence"
+
+    def should_transcribe(self, audio_file: str, min_confidence: float = 0.1, 
+                         min_duration: float = 1.0) -> tuple[bool, Dict[str, Any]]:
+        """Determine if audio file should be transcribed based on analysis"""
+        try:
+            # Load audio for analysis
+            audio_data, sample_rate = self.load_audio(audio_file)
+            
+            # Analyze audio quality
+            analysis = self.analyze_audio_quality(audio_data, sample_rate)
+            
+            # Check if we should proceed
+            should_proceed = (
+                analysis["is_likely_speech"] and
+                analysis["confidence_score"] >= min_confidence and
+                analysis["duration_seconds"] >= min_duration
+            )
+            
+            logging.info(f"Audio analysis for {audio_file}:")
+            logging.info(f"  Duration: {analysis['duration_seconds']:.2f}s")
+            logging.info(f"  Speech confidence: {analysis['confidence_score']:.3f}")
+            logging.info(f"  Recommendation: {analysis['recommendation']}")
+            logging.info(f"  Should transcribe: {should_proceed}")
+            
+            return should_proceed, analysis
+            
+        except Exception as e:
+            logging.error(f"Error analyzing audio {audio_file}: {e}")
+            return False, {"error": str(e), "recommendation": "SKIP - Analysis failed"}
+
 
 class ModelManager:
     """Handles model loading and transcription"""
@@ -632,7 +783,10 @@ class Transcriber:
         logging.info(f"Logging to: {log_file}")
 
     def process_file(self, audio_file: str, output_dir: str = "transcriptions", 
-                    num_speakers: Optional[int] = None) -> TranscriptionResult:
+                    num_speakers: Optional[int] = None, 
+                    skip_analysis: bool = False,
+                    min_confidence: float = 0.1,
+                    min_duration: float = 1.0) -> TranscriptionResult:
         """Process single audio file and return structured result"""
         try:
             audio_path = Path(audio_file)
@@ -649,6 +803,34 @@ class Transcriber:
             
             logging.info(f"Processing: {audio_file}")
             logging.info(f"Output will be saved to: {output_file}")
+            
+            # Pre-transcription audio analysis
+            if not skip_analysis:
+                logging.info("🔍 Analyzing audio quality before transcription...")
+                should_transcribe, analysis = self.model_manager.audio_processor.should_transcribe(
+                    audio_file, min_confidence, min_duration
+                )
+                
+                if not should_transcribe:
+                    logging.warning(f"⚠️  Skipping transcription based on audio analysis:")
+                    logging.warning(f"   Recommendation: {analysis.get('recommendation', 'Unknown')}")
+                    logging.warning(f"   Confidence: {analysis.get('confidence_score', 0):.3f}")
+                    logging.warning(f"   Duration: {analysis.get('duration_seconds', 0):.2f}s")
+                    
+                    # Create a minimal result for skipped files
+                    return TranscriptionResult(
+                        text="[SKIPPED - No speech detected]",
+                        segments=[],
+                        speaker_segments=[],
+                        merged_segments=[],
+                        model_name=self.model_manager.model_name,
+                        processing_time=0.0,
+                        gpu_memory_used=0.0,
+                        timestamp=datetime.now().isoformat(),
+                        audio_file=str(audio_path.absolute())
+                    )
+                else:
+                    logging.info(f"✅ Audio analysis passed - proceeding with transcription")
             
             # Create transcription configuration
             config = TranscriptionConfig(
@@ -738,8 +920,11 @@ class Transcriber:
             json.dump(output_data, f, indent=2, ensure_ascii=False)
 
     def process_batch(self, audio_dir: str, output_dir: str = "transcriptions", 
-                     pattern: str = "*.wav", num_speakers: Optional[int] = None) -> List[TranscriptionResult]:
-        """Process multiple audio files"""
+                     pattern: str = "*.wav", num_speakers: Optional[int] = None,
+                     skip_analysis: bool = False,
+                     min_confidence: float = 0.1,
+                     min_duration: float = 1.0) -> List[TranscriptionResult]:
+        """Process multiple audio files with optional pre-analysis"""
         audio_path = Path(audio_dir)
         audio_files = list(audio_path.glob(pattern))
         
@@ -748,12 +933,37 @@ class Transcriber:
             return []
         
         logging.info(f"Found {len(audio_files)} audio files to process")
+        
+        # Pre-analyze all files if analysis is enabled
+        files_to_process = []
+        skipped_files = []
+        
+        if not skip_analysis:
+            logging.info("🔍 Pre-analyzing all audio files...")
+            for audio_file in audio_files:
+                should_transcribe, analysis = self.model_manager.audio_processor.should_transcribe(
+                    str(audio_file), min_confidence, min_duration
+                )
+                
+                if should_transcribe:
+                    files_to_process.append(audio_file)
+                else:
+                    skipped_files.append((audio_file, analysis))
+                    logging.info(f"⏭️  Skipping {audio_file.name}: {analysis.get('recommendation', 'Unknown')}")
+            
+            logging.info(f"📊 Analysis complete: {len(files_to_process)} files to process, {len(skipped_files)} skipped")
+        else:
+            files_to_process = audio_files
+            logging.info("⚠️  Skipping audio analysis - processing all files")
+        
         results = []
         
-        for i, audio_file in enumerate(audio_files, 1):
+        for i, audio_file in enumerate(files_to_process, 1):
             try:
-                logging.info(f"Processing file {i}/{len(audio_files)}: {audio_file.name}")
-                result = self.process_file(str(audio_file), output_dir, num_speakers)
+                logging.info(f"Processing file {i}/{len(files_to_process)}: {audio_file.name}")
+                result = self.process_file(str(audio_file), output_dir, num_speakers, 
+                                         skip_analysis=True, min_confidence=min_confidence, 
+                                         min_duration=min_duration)
                 results.append(result)
                 
                 # Clean up between files
@@ -763,7 +973,25 @@ class Transcriber:
                 logging.error(f"Failed to process {audio_file}: {e}")
                 continue
         
-        logging.info(f"Batch processing completed. Processed {len(results)}/{len(audio_files)} files")
+        # Add skipped files to results
+        for audio_file, analysis in skipped_files:
+            result = TranscriptionResult(
+                text="[SKIPPED - No speech detected]",
+                segments=[],
+                speaker_segments=[],
+                merged_segments=[],
+                model_name=self.model_manager.model_name,
+                processing_time=0.0,
+                gpu_memory_used=0.0,
+                timestamp=datetime.now().isoformat(),
+                audio_file=str(audio_file.absolute())
+            )
+            results.append(result)
+        
+        logging.info(f"Batch processing completed. Processed {len(files_to_process)}/{len(audio_files)} files")
+        if skipped_files:
+            logging.info(f"Skipped {len(skipped_files)} files due to low speech content")
+        
         return results
 
 
@@ -814,6 +1042,12 @@ def main():
                        help="Process all audio files in the specified directory")
     parser.add_argument("--pattern", default="*.wav",
                        help="File pattern for batch processing")
+    parser.add_argument("--skip-analysis", action="store_true",
+                       help="Skip audio quality analysis (process all files)")
+    parser.add_argument("--min-confidence", type=float, default=0.1,
+                       help="Minimum speech confidence threshold (0.0-1.0, default: 0.1)")
+    parser.add_argument("--min-duration", type=float, default=1.0,
+                       help="Minimum audio duration in seconds (default: 1.0)")
     
     args = parser.parse_args()
     
@@ -841,7 +1075,10 @@ def main():
                 args.audio_file, 
                 args.output_dir, 
                 args.pattern, 
-                args.num_speakers
+                args.num_speakers,
+                skip_analysis=args.skip_analysis,
+                min_confidence=args.min_confidence,
+                min_duration=args.min_duration
             )
             print(f"Processed {len(results)} files")
         else:
@@ -849,7 +1086,10 @@ def main():
             result = transcriber.process_file(
                 args.audio_file, 
                 args.output_dir, 
-                args.num_speakers
+                args.num_speakers,
+                skip_analysis=args.skip_analysis,
+                min_confidence=args.min_confidence,
+                min_duration=args.min_duration
             )
             print(f"Transcription: {result.text}")
             
