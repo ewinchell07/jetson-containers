@@ -43,8 +43,9 @@ max_quality_retries: 2          # Maximum retries with larger models
 enable_large_models: false       # Allow large models for adaptive transcription (requires more resources)
 
 # Recording Date Filter
-transcribe_from_date: "2025-10-02"  # Only transcribe recordings from this date onwards (YYYY-MM-DD format)
-# Set to null or empty to transcribe all recordings regardless of date
+transcribe_from_date: "2025-10-08"  # Transcribe all recordings regardless of date
+# Set to a specific date (YYYY-MM-DD format) to only transcribe recordings from that date onwards
+# Examples: "2025-09-15" or "2025-10-01"
 
 # Health Monitoring
 health_check_interval: 300      # Check recording health every 5 minutes

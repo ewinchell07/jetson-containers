@@ -263,9 +263,34 @@ python3 continuous_recorder.py --channels 4
 | `--no-save-individual` | Disable saving individual files | `False` |
 | `--channel-names` | Names for each channel | Auto-generated |
 | `--apply-gain-to` | Channel indices to apply gain to (0-indexed) | `2 3` (channels 3,4) |
+| `--no-noise-filter` | Disable noise filtering (gain whine removal) | `False` |
+| `--high-pass` | High-pass filter frequency in Hz | `80` |
+| `--low-pass` | Low-pass filter frequency in Hz | `8000` |
+| `--notch-freq` | Notch filter frequency for power line hum in Hz | `60` |
 | `--amplify` | Enable audio amplification | `True` |
 | `--gain` | Audio gain boost multiplier | `1.5` |
 | `--normalize` | Normalize audio to prevent clipping | `True` |
+
+#### Noise Filtering Options
+
+The recorder includes built-in noise filtering to remove common audio artifacts:
+
+- **`--no-noise-filter`** - Disable all noise filtering
+- **`--high-pass FREQ`** - High-pass filter frequency (default: 80Hz) - removes low-frequency rumble
+- **`--low-pass FREQ`** - Low-pass filter frequency (default: 8000Hz) - removes high-frequency noise and gain whine
+- **`--notch-freq FREQ`** - Notch filter frequency (default: 60Hz) - removes power line hum
+
+**Example usage:**
+```bash
+# Remove gain whine with custom filtering
+python3 continuous_recorder.py --low-pass 6000 --high-pass 100
+
+# Disable filtering entirely
+python3 continuous_recorder.py --no-noise-filter
+
+# Remove 50Hz European power line hum
+python3 continuous_recorder.py --notch-freq 50
+```
 
 #### Channel Splitting Options
 

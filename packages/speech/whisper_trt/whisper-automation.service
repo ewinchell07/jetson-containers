@@ -18,6 +18,10 @@ StandardError=journal
 Environment=PYTHONPATH=/home/ethan/jetson-containers/packages/speech/whisper_trt
 Environment=TRANSCRIBE_MODEL=small
 Environment=ALLOW_SWAP=true
+Environment=ENABLE_QUALITY_RETRY=true
+Environment=QUALITY_THRESHOLD=0.3
+Environment=MAX_QUALITY_RETRIES=2
+Environment=ENABLE_LARGE_MODELS=false
 
 # Security settings (relaxed for Docker access)
 NoNewPrivileges=false

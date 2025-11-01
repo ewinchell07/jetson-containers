@@ -6,3 +6,4 @@ soundfile
 sounddevice
 librosa
 scikit-learn
+pytz

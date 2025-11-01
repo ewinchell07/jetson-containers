@@ -6,16 +6,23 @@ Handles environment variables and system-specific settings.
 
 import os
 import logging
+import re
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
+import pytz
 
 logger = logging.getLogger(__name__)
 
 # Default configuration values
-DEFAULT_TRANSCRIBE_MODEL = "small"
+DEFAULT_TRANSCRIBE_MODEL = "small.en"  # Use English-only model by default
 DEFAULT_ALLOW_SWAP = True
 DEFAULT_MAX_DURATION_MIN = None
-DEFAULT_TRANSCRIBE_PROMPT = ("")
+DEFAULT_TRANSCRIBE_PROMPT = ""  # Empty by default, will be generated dynamically
+
+# Timezone configuration
+UTC_TZ = pytz.UTC
+PT_TZ = pytz.timezone('America/Los_Angeles')  # Pacific Time (handles PST/PDT automatically)
 
 # Diarization configuration defaults
 DEFAULT_DIARIZATION_CONFIG = {
@@ -93,9 +100,204 @@ def get_max_duration_min() -> Optional[int]:
     return None
 
 
-def get_transcribe_prompt() -> str:
-    """Get the transcription prompt from environment or default."""
-    return os.getenv('TRANSCRIBE_PROMPT', DEFAULT_TRANSCRIBE_PROMPT)
+def extract_timestamp_from_filename(filename: str) -> Optional[datetime]:
+    """
+    Extract UTC timestamp from recording filename.
+    Expected format: recording_YYYYMMDD_HHMMSS_Channel Name.wav
+    or: recording_YYYYMMDD_HHMMSS.wav
+    
+    Args:
+        filename: Recording filename
+        
+    Returns:
+        Datetime object in UTC, or None if parsing fails
+    """
+    try:
+        # Remove directory path if present
+        base_name = Path(filename).stem
+        
+        # Match pattern: recording_YYYYMMDD_HHMMSS_*
+        match = re.search(r'recording_(\d{8})_(\d{6})', base_name)
+        if match:
+            date_str = match.group(1)  # YYYYMMDD
+            time_str = match.group(2)  # HHMMSS
+            
+            # Parse as UTC
+            utc_dt = datetime.strptime(f"{date_str}_{time_str}", "%Y%m%d_%H%M%S")
+            # Localize to UTC
+            utc_dt = UTC_TZ.localize(utc_dt)
+            
+            return utc_dt
+        else:
+            logger.warning(f"Could not extract timestamp from filename: {filename}")
+            return None
+    except Exception as e:
+        logger.warning(f"Error extracting timestamp from filename {filename}: {e}")
+        return None
+
+
+def convert_utc_to_pt(utc_dt: datetime) -> datetime:
+    """
+    Convert UTC datetime to Pacific Time (handles PST/PDT automatically).
+    
+    Args:
+        utc_dt: UTC datetime (must be timezone-aware)
+        
+    Returns:
+        Pacific Time datetime
+    """
+    if utc_dt.tzinfo is None:
+        # If naive, assume UTC
+        utc_dt = UTC_TZ.localize(utc_dt)
+    
+    # Convert to PT
+    pt_dt = utc_dt.astimezone(PT_TZ)
+    return pt_dt
+
+
+def generate_context_prompt(room_name: str, recording_time_utc: Optional[datetime] = None) -> str:
+    """
+    Generate an optimized context-aware prompt for family interaction transcription.
+    
+    The prompt is designed to:
+    - Provide context (time and location)
+    - Bias Whisper toward family/parenting vocabulary
+    - Help with child speech recognition (common mispronunciations, developing language)
+    - Include common parenting phrases and terminology
+    
+    Args:
+        room_name: Name of the room/channel
+        recording_time_utc: UTC datetime of recording (will be converted to PT)
+        
+    Returns:
+        Optimized prompt string with family interaction vocabulary
+    """
+    # Build base context (time and location)
+    base_context = ""
+    if recording_time_utc:
+        pt_time = convert_utc_to_pt(recording_time_utc)
+        
+        # Format: "Saturday, October 26, 2025 at 5:56 PM" in PT
+        day_name = pt_time.strftime("%A")
+        month_name = pt_time.strftime("%B")
+        day = pt_time.day
+        year = pt_time.year
+        hour = pt_time.hour
+        minute = pt_time.minute
+        
+        # Convert to 12-hour format
+        if hour == 0:
+            hour_12 = 12
+            am_pm = "AM"
+        elif hour < 12:
+            hour_12 = hour
+            am_pm = "AM"
+        elif hour == 12:
+            hour_12 = 12
+            am_pm = "PM"
+        else:
+            hour_12 = hour - 12
+            am_pm = "PM"
+        
+        # Format time: "5:56 PM" or "5 PM" (no minutes if zero, no leading zero for hour)
+        if minute == 0:
+            time_str = f"{hour_12} {am_pm}"
+        else:
+            time_str = f"{hour_12}:{minute:02d} {am_pm}"
+        
+        base_context = f"Family conversation in the {room_name} on {day_name}, {month_name} {day}, {year} at {time_str}. "
+    else:
+        base_context = f"Family conversation in the {room_name}. "
+    
+    # Family and parenting vocabulary to bias the model
+    # Natural language format that demonstrates vocabulary in context
+    # This helps Whisper understand pronunciation variations and common phrases
+    family_vocab = (
+        "Common terms include mommy, daddy, baby, child, kid, parent, family. "
+        "Food words like waffle, milk, water, candy, croissant, snack, breakfast, lunch, dinner. "
+        "Activities such as play, toy, game, sleep, nap, bed, bedtime, potty, diaper, pee, poop, tinkle. "
+        "Phrases: I love you, thank you, please, all done, good job, let's try, that's okay, you're okay. "
+        "Common words: yes, no, okay, oh no, what, why, where, help, want, need, can't, don't, won't. "
+        "Child speech patterns: wawa for water, nana for banana, paci for pacifier, potty training terminology."
+    )
+    
+    # Combine context with vocabulary bias
+    # The prompt helps Whisper understand the domain and recognize child speech patterns
+    prompt = base_context + family_vocab
+    
+    return prompt
+
+
+def extract_room_name_from_filename(filename: str) -> str:
+    """
+    Extract room name from recording filename.
+    Expected format: recording_YYYYMMDD_HHMMSS_Channel Name.wav
+    
+    Args:
+        filename: Recording filename
+        
+    Returns:
+        Room/channel name, or "Unknown" if not found
+    """
+    try:
+        base_name = Path(filename).stem
+        
+        # Try to extract room name after timestamp
+        match = re.search(r'recording_\d{8}_\d{6}_(.+)', base_name)
+        if match:
+            room_name = match.group(1)
+            # Clean up any remaining suffixes
+            room_name = re.sub(r'(_ch\d+|_partial)$', '', room_name)
+            return room_name
+        
+        # If no room name found, try to infer from pattern
+        # Check for common channel indicators
+        if '_ch1' in base_name or 'TV Living Room' in base_name:
+            return 'TV Living Room'
+        elif '_ch2' in base_name or 'Dining Room' in base_name:
+            return 'Dining Room'
+        elif '_ch3' in base_name or 'Penn Bedroom' in base_name:
+            return 'Penn Bedroom'
+        elif '_ch4' in base_name or 'Rowe Bedroom' in base_name:
+            return 'Rowe Bedroom'
+        
+        return "Unknown Location"
+    except Exception as e:
+        logger.warning(f"Error extracting room name from filename {filename}: {e}")
+        return "Unknown Location"
+
+
+def get_transcribe_prompt(audio_file: Optional[str] = None) -> str:
+    """
+    Get the transcription prompt from environment or generate dynamically.
+    
+    If audio_file is provided, extracts timestamp and room name from filename
+    to generate a context-aware prompt with timezone conversion (UTC to PT).
+    
+    Args:
+        audio_file: Optional path to audio file for dynamic prompt generation
+        
+    Returns:
+        Transcription prompt string
+    """
+    # Check for explicit environment variable override
+    env_prompt = os.getenv('TRANSCRIBE_PROMPT')
+    if env_prompt:
+        return env_prompt
+    
+    # If audio file provided, generate dynamic prompt
+    if audio_file:
+        try:
+            room_name = extract_room_name_from_filename(audio_file)
+            recording_time = extract_timestamp_from_filename(audio_file)
+            prompt = generate_context_prompt(room_name, recording_time)
+            logger.info(f"Generated context prompt: {prompt[:80]}...")
+            return prompt
+        except Exception as e:
+            logger.warning(f"Error generating dynamic prompt, using default: {e}")
+    
+    # Fallback to default
+    return DEFAULT_TRANSCRIBE_PROMPT
 
 
 def get_diarization_config() -> dict:
@@ -250,6 +452,7 @@ def select_model_with_fallback(requested_model: str, allow_swap: bool) -> str:
 def _fallback_to_smaller_model(requested_model: str) -> str:
     """
     Fall back to a smaller model when swap is insufficient.
+    Prefers English-only models to prevent language detection issues.
     
     Args:
         requested_model: The originally requested model
@@ -260,9 +463,10 @@ def _fallback_to_smaller_model(requested_model: str) -> str:
     fallback_chain = {
         "large-v3": "large-v2",
         "large-v2": "large",
-        "large": "medium",
-        "medium": "small",
-        "medium.en": "small.en"
+        "large": "medium.en",  # Prefer English-only models
+        "medium": "medium.en",  # Convert to English-only
+        "medium.en": "small.en",
+        "small": "small.en"  # Convert to English-only
     }
     
     current = requested_model
@@ -275,9 +479,9 @@ def _fallback_to_smaller_model(requested_model: str) -> str:
             logger.info(f"Falling back to {current} (requires {required_swap}GB swap)")
             return current
     
-    # Final fallback to small
-    logger.info("Final fallback to small model")
-    return "small"
+    # Final fallback to small.en (English-only)
+    logger.info("Final fallback to small.en model (English-only)")
+    return "small.en"
 
 
 def get_model_swap_requirements(model: str) -> int:

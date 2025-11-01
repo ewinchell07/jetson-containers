@@ -20,6 +20,7 @@ import warnings
 import logging
 import gc
 import whisper
+import re
 from datetime import datetime
 from pathlib import Path
 from dataclasses import dataclass
@@ -46,6 +47,188 @@ except ImportError as e:
 # Suppress warnings
 warnings.filterwarnings("ignore", category=UserWarning)
 warnings.filterwarnings("ignore", category=DeprecationWarning)
+
+
+    
+
+
+def detect_non_english_characters(text: str) -> Dict[str, Any]:
+    """
+    Detect non-English characters in transcription text.
+    
+    Args:
+        text: Transcription text to analyze
+        
+    Returns:
+        Dictionary with detection results
+    """
+    if not text or not text.strip():
+        return {"has_non_english": False, "non_english_chars": [], "confidence": 0.0}
+    
+    non_english_chars = []
+    asian_chars = []
+    
+    for char in text:
+        # Check for non-ASCII characters
+        if ord(char) > 127:
+            non_english_chars.append(char)
+            
+            # Check for Asian language characters
+            try:
+                # Chinese, Japanese, Korean ranges
+                if (0x4E00 <= ord(char) <= 0x9FFF or  # CJK Unified Ideographs
+                    0x3400 <= ord(char) <= 0x4DBF or  # CJK Extension A
+                    0x20000 <= ord(char) <= 0x2A6DF or # CJK Extension B
+                    0x3040 <= ord(char) <= 0x309F or  # Hiragana
+                    0x30A0 <= ord(char) <= 0x30FF or  # Katakana
+                    0xAC00 <= ord(char) <= 0xD7AF):   # Hangul
+                    asian_chars.append(char)
+            except:
+                pass
+    
+    # Calculate confidence based on character density
+    total_chars = len([c for c in text if c.isalpha() or c.isdigit()])
+    non_english_ratio = len(non_english_chars) / max(total_chars, 1)
+    asian_ratio = len(asian_chars) / max(total_chars, 1)
+    
+    # High confidence if significant Asian characters detected
+    confidence = min(1.0, asian_ratio * 10)  # Scale up Asian character impact
+    
+    return {
+        "has_non_english": len(non_english_chars) > 0,
+        "has_asian_chars": len(asian_chars) > 0,
+        "non_english_chars": list(set(non_english_chars)),
+        "asian_chars": list(set(asian_chars)),
+        "non_english_ratio": non_english_ratio,
+        "asian_ratio": asian_ratio,
+        "confidence": confidence
+    }
+
+
+def filter_prompt_repetition(text: str, prompt: str, max_repetitions: int = 2) -> str:
+    """
+    Remove excessive repetitions of the prompt from transcription text.
+    
+    Whisper sometimes transcribes the prompt itself when it's detected in audio.
+    This function removes excessive repetitions while keeping the text if it appears
+    naturally (e.g., someone actually says the prompt).
+    
+    Args:
+        text: Transcription text
+        prompt: The prompt that was used
+        max_repetitions: Maximum number of prompt occurrences to allow before filtering
+        
+    Returns:
+        Text with prompt repetitions filtered
+    """
+    if not prompt or not text:
+        return text
+    
+    # Normalize both texts for comparison (case-insensitive, whitespace normalized)
+    prompt_normalized = ' '.join(prompt.lower().split())
+    text_normalized = ' '.join(text.lower().split())
+    
+    # Count occurrences of prompt in text
+    prompt_count = text_normalized.count(prompt_normalized)
+    
+    # If prompt appears too many times, it's likely an artifact
+    if prompt_count > max_repetitions:
+        logging.info(f"Filtering {prompt_count} prompt repetitions (max allowed: {max_repetitions})")
+        
+        # Remove all occurrences of the prompt
+        # Use case-insensitive replacement, preserving original case structure
+        pattern = re.escape(prompt)
+        # Replace with empty string, case-insensitive
+        filtered_text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+        
+        # Clean up extra whitespace
+        filtered_text = ' '.join(filtered_text.split())
+        
+        return filtered_text
+    
+    # If prompt appears naturally (few times), keep it - might be actual speech
+    return text
+
+
+def validate_transcription_language(transcription_result: Dict[str, Any], 
+                                  max_asian_ratio: float = 0.05) -> Dict[str, Any]:
+    """
+    Validate that transcription contains primarily English text.
+    
+    Args:
+        transcription_result: Transcription result dictionary
+        max_asian_ratio: Maximum allowed ratio of Asian characters
+        
+    Returns:
+        Validation result with recommendations
+    """
+    text = transcription_result.get('text', '')
+    if not text or not text.strip():
+        return {
+            "is_valid": True,
+            "reason": "Empty transcription",
+            "confidence": 0.0,
+            "recommendation": "PROCEED"
+        }
+    
+    # Detect non-English characters
+    detection = detect_non_english_characters(text)
+    
+    # Check for excessive repetition (common artifact)
+    words = text.split()
+    if len(words) > 10:
+        word_counts = {}
+        for word in words:
+            word_counts[word] = word_counts.get(word, 0) + 1
+        
+        max_repetition = max(word_counts.values())
+        repetition_ratio = max_repetition / len(words)
+        
+        if repetition_ratio > 0.3:  # More than 30% repetition
+            return {
+                "is_valid": False,
+                "reason": f"Excessive repetition detected ({repetition_ratio:.2%})",
+                "confidence": 0.9,
+                "recommendation": "REJECT - Likely audio artifacts",
+                "detection": detection
+            }
+    
+    # Check for Asian character ratio
+    if detection["asian_ratio"] > max_asian_ratio:
+        return {
+            "is_valid": False,
+            "reason": f"Asian characters detected ({detection['asian_ratio']:.2%})",
+            "confidence": detection["confidence"],
+            "recommendation": "REJECT - Non-English content detected",
+            "detection": detection
+        }
+    
+    # Check for suspicious patterns
+    suspicious_patterns = [
+        r'这个+',  # Chinese repetition
+        r'わかった+',  # Japanese repetition
+        r'車+',  # Japanese repetition
+        r'ー+',  # Japanese long vowel repetition
+    ]
+    
+    for pattern in suspicious_patterns:
+        if re.search(pattern, text):
+            return {
+                "is_valid": False,
+                "reason": f"Suspicious pattern detected: {pattern}",
+                "confidence": 0.8,
+                "recommendation": "REJECT - Audio artifacts detected",
+                "detection": detection
+            }
+    
+    # If we get here, the transcription appears valid
+    return {
+        "is_valid": True,
+        "reason": "Valid English transcription",
+        "confidence": 1.0 - detection["asian_ratio"],
+        "recommendation": "PROCEED",
+        "detection": detection
+    }
 
 
 @dataclass
@@ -561,6 +744,10 @@ class DiarizationManager:
         """Cluster speaker embeddings to identify different speakers"""
         from sklearn.cluster import AgglomerativeClustering
         
+        # Handle empty embeddings
+        if len(embeddings) == 0:
+            return []
+        
         diarization_config = get_diarization_config()
         if num_speakers is None:
             num_speakers = min(max(2, len(embeddings) // 10), diarization_config["max_speakers"])
@@ -568,10 +755,25 @@ class DiarizationManager:
         num_speakers = max(diarization_config["min_speakers"], 
                           min(num_speakers, diarization_config["max_speakers"]))
         
-        clustering = AgglomerativeClustering(n_clusters=num_speakers, linkage='ward')
-        speaker_labels = clustering.fit_predict(embeddings)
+        # Ensure we don't have more speakers than embeddings
+        num_speakers = min(num_speakers, len(embeddings))
         
-        return speaker_labels
+        if num_speakers <= 1:
+            return [0] * len(embeddings)
+        
+        try:
+            clustering = AgglomerativeClustering(n_clusters=num_speakers, linkage='ward')
+            speaker_labels = clustering.fit_predict(embeddings)
+            
+            # Convert numpy array to list to avoid boolean ambiguity
+            if hasattr(speaker_labels, 'tolist'):
+                return speaker_labels.tolist()
+            else:
+                return list(speaker_labels)
+                
+        except Exception as e:
+            logging.warning(f"Clustering failed: {e}, using single speaker")
+            return [0] * len(embeddings)
 
     def process_audio(self, audio_file: str, num_speakers: Optional[int] = None) -> List[Dict[str, Any]]:
         """Process audio for speaker diarization"""
@@ -722,6 +924,9 @@ class Transcriber:
     
     def __init__(self, model_name: str, hf_token: Optional[str] = None, enable_diarization: bool = True,
                  use_adaptive_quality: bool = None):
+        # Setup logging first
+        self._setup_logging()
+        
         self.model_manager = ModelManager(model_name)
         self.diarization_manager = None
         self.speaker_merger = SpeakerMerger()
@@ -764,23 +969,53 @@ class Transcriber:
             self.adaptive_transcriber = None
         
         logging.info(f"Adaptive quality enabled: {self.use_adaptive_quality}")
-        self._setup_logging()
 
     def _setup_logging(self) -> None:
         """Setup logging configuration"""
+        # Only setup if not already configured
+        if logging.getLogger().handlers:
+            return
+            
         log_dir = Path.home() / ".cache" / "whisper_trt" / "logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_file = log_dir / f"transcriber_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
         
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s [%(levelname)s] %(message)s',
-            handlers=[
-                logging.FileHandler(log_file),
-                logging.StreamHandler()
-            ]
-        )
-        logging.info(f"Logging to: {log_file}")
+        # Create a new logger for this transcriber instance
+        self.logger = logging.getLogger(f"transcriber_{id(self)}")
+        self.logger.setLevel(logging.INFO)
+        
+        # Clear any existing handlers
+        self.logger.handlers.clear()
+        
+        # Add file handler
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(logging.INFO)
+        file_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        file_handler.setFormatter(file_formatter)
+        self.logger.addHandler(file_handler)
+        
+        # Add console handler
+        console_handler = logging.StreamHandler()
+        console_handler.setLevel(logging.INFO)
+        console_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
+        console_handler.setFormatter(console_formatter)
+        self.logger.addHandler(console_handler)
+        
+        # Prevent propagation to root logger
+        self.logger.propagate = False
+        
+        self.logger.info(f"Transcriber logging initialized: {log_file}")
+        
+        # Also setup root logger if not already done
+        if not logging.getLogger().handlers:
+            logging.basicConfig(
+                level=logging.INFO,
+                format='%(asctime)s [%(levelname)s] %(message)s',
+                handlers=[
+                    logging.FileHandler(log_file),
+                    logging.StreamHandler()
+                ]
+            )
 
     def process_file(self, audio_file: str, output_dir: str = "transcriptions", 
                     num_speakers: Optional[int] = None, 
@@ -832,9 +1067,10 @@ class Transcriber:
                 else:
                     logging.info(f"✅ Audio analysis passed - proceeding with transcription")
             
-            # Create transcription configuration
+            # Create transcription configuration with dynamic context-aware prompt
+            base_prompt = get_transcribe_prompt(audio_file)
             config = TranscriptionConfig(
-                initial_prompt=get_transcribe_prompt()
+                initial_prompt=base_prompt
             )
             
             # Transcribe with adaptive quality if enabled
@@ -852,6 +1088,43 @@ class Transcriber:
                 logging.info("Using standard transcription")
                 result = self.model_manager.transcribe_audio(audio_file, config)
                 result_dict = result
+            
+            # Validate transcription language before proceeding
+            logging.info("🔍 Validating transcription language...")
+            validation_result = validate_transcription_language(result_dict)
+            
+            if not validation_result["is_valid"]:
+                logging.warning(f"⚠️  Language validation failed: {validation_result['reason']}")
+                logging.warning(f"   Recommendation: {validation_result['recommendation']}")
+                logging.warning(f"   Confidence: {validation_result['confidence']:.3f}")
+                
+                # Create a rejected result
+                return TranscriptionResult(
+                    text="[REJECTED - Language validation failed]",
+                    segments=[],
+                    speaker_segments=[],
+                    merged_segments=[],
+                    model_name=self.model_manager.model_name,
+                    processing_time=result_dict.get('processing_time', 0.0),
+                    gpu_memory_used=GPUManager.get_memory_usage(),
+                    timestamp=datetime.now().isoformat(),
+                    audio_file=str(audio_path.absolute())
+                )
+            else:
+                logging.info(f"✅ Language validation passed: {validation_result['reason']}")
+            
+            # Filter prompt repetitions from transcription text
+            if base_prompt and result_dict.get('text'):
+                original_text = result_dict['text']
+                filtered_text = filter_prompt_repetition(original_text, base_prompt)
+                if filtered_text != original_text:
+                    logging.info(f"Filtered prompt repetitions from transcription")
+                    result_dict['text'] = filtered_text
+                    # Also filter from segments if they exist
+                    if 'segments' in result_dict:
+                        for segment in result_dict['segments']:
+                            if 'text' in segment:
+                                segment['text'] = filter_prompt_repetition(segment['text'], base_prompt)
             
             # Add diarization if available
             speaker_segments = []
@@ -995,9 +1268,9 @@ class Transcriber:
         return results
 
 
-def get_transcription_config() -> Dict[str, Any]:
+def get_transcription_config(audio_file: Optional[str] = None) -> Dict[str, Any]:
     """Get transcription configuration (legacy compatibility)"""
-    config = TranscriptionConfig(initial_prompt=get_transcribe_prompt())
+    config = TranscriptionConfig(initial_prompt=get_transcribe_prompt(audio_file))
     return {
         "temperature": config.temperature,
         "beam_size": config.beam_size,

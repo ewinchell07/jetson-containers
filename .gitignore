@@ -26,3 +26,22 @@ packages/speech/whisperx/recordings/
 # Transcription directories
 packages/speech/whisper_trt/transcriptions/
 packages/speech/whisperx/transcriptions/
+
+# Environment files and secrets
+.env
+*.env
+!.env.template
+!env.template
+
+# Config files with personal data
+packages/speech/whisper_trt/parenting_ai/config.yaml
+
+# Parenting AI index and personal data
+**/parenting_ai_index/
+packages/speech/whisper_trt/parenting_ai_index/
+packages/speech/whisper_trt/parenting_ai/parenting_ai_index/
+
+# Log files (may contain sensitive data)
+**/parenting_ai.log
+packages/speech/whisper_trt/parenting_ai/*.log
+packages/speech/whisper_trt/parenting_ai/logs/

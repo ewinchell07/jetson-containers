@@ -40,6 +40,19 @@ class AudioConfig:
     normalize_audio: bool = True  # Normalize to prevent clipping
     gain_boost: float = 1.5  # Amplification factor (1.0 = no change, 2.0 = double volume)
     
+    # Audio filtering settings
+    enable_noise_filtering: bool = True  # Enable noise filtering
+    high_pass_freq: float = 200.0  # High-pass filter frequency (Hz) - increased to remove more low-frequency artifacts
+    low_pass_freq: float = 8000.0  # Low-pass filter frequency (Hz)
+    notch_freq: float = 60.0  # Notch filter frequency for power line hum (Hz)
+    notch_q: float = 30.0  # Notch filter Q factor
+    
+    # Gain noise filtering settings (500Hz and harmonics)
+    enable_gain_noise_filtering: bool = True  # Enable 500Hz gain noise filtering
+    gain_noise_base_freq: float = 500.0  # Base gain noise frequency (Hz)
+    gain_noise_max_freq: float = 6000.0  # Maximum frequency to filter harmonics up to (Hz)
+    gain_noise_q: float = 30.0  # Q factor for gain noise notch filters
+    
     # Multi-channel recording settings
     save_combined: bool = False  # Save combined multi-channel file
     save_individual: bool = True  # Save individual channel files (default)
@@ -138,7 +151,7 @@ class ContinuousRecorder:
         else:
             # Default channel names for 4-channel setup
             if self.config.channels == 4:
-                self.channel_names = ['ch1', 'ch2', 'ch3', 'ch4']
+                self.channel_names = ['TV Living Room', 'Dining Room', 'Penn Bedroom', 'Rowe Bedroom']
             else:
                 self.channel_names = [f'ch{i+1}' for i in range(self.config.channels)]
         
@@ -223,7 +236,7 @@ class ContinuousRecorder:
         
         for i, device in enumerate(devices):
             device_name = device['name'].lower()
-            if 'focusrite' in device_name and ('4i4' in device_name or 'scarlett' in device_name):
+            if ('focusrite' in device_name or 'scarlett' in device_name) and '4i4' in device_name:
                 focusrite_device = i
                 print(f"🎯 Found Focusrite 4i4/Scarlett at device {i}: {device['name']}")
                 break
@@ -409,6 +422,82 @@ class ContinuousRecorder:
         except Exception as e:
             logging.error(f"Audio amplification failed for channel {channel_idx}: {e}")
             return audio_data  # Return original if amplification fails
+    
+    def _filter_audio(self, audio_data: np.ndarray, sample_rate: int) -> np.ndarray:
+        """Apply noise filtering to remove gain whine and other artifacts"""
+        if not self.config.enable_noise_filtering:
+            return audio_data
+            
+        try:
+            # Convert to float for processing
+            if audio_data.dtype == np.int16:
+                audio_float = audio_data.astype(np.float32) / 32768.0
+            elif audio_data.dtype == np.int32:
+                audio_float = audio_data.astype(np.float32) / 2147483647.0
+            else:
+                audio_float = audio_data.astype(np.float32)
+            
+            # Apply high-pass filter to remove low-frequency rumble
+            if self.config.high_pass_freq > 0:
+                from scipy import signal
+                nyquist = sample_rate / 2
+                high_pass_cutoff = min(self.config.high_pass_freq / nyquist, 0.99)
+                b, a = signal.butter(2, high_pass_cutoff, btype='high')
+                audio_float = signal.filtfilt(b, a, audio_float)
+            
+            # Apply low-pass filter to remove high-frequency noise (gain whine)
+            if self.config.low_pass_freq > 0:
+                from scipy import signal
+                nyquist = sample_rate / 2
+                low_pass_cutoff = min(self.config.low_pass_freq / nyquist, 0.99)
+                b, a = signal.butter(4, low_pass_cutoff, btype='low')
+                audio_float = signal.filtfilt(b, a, audio_float)
+            
+            # Apply notch filter to remove power line hum (60Hz)
+            if self.config.notch_freq > 0:
+                from scipy import signal
+                notch_freq_norm = self.config.notch_freq / (sample_rate / 2)
+                if notch_freq_norm < 0.99:
+                    b, a = signal.iirnotch(notch_freq_norm, self.config.notch_q)
+                    audio_float = signal.filtfilt(b, a, audio_float)
+            
+            # Apply multiple notch filters to remove 500Hz gain noise and its harmonics
+            if self.config.enable_gain_noise_filtering:
+                from scipy import signal
+                nyquist = sample_rate / 2
+                
+                # Calculate all harmonic frequencies up to the maximum
+                harmonic_freqs = []
+                freq = self.config.gain_noise_base_freq
+                while freq <= self.config.gain_noise_max_freq and freq < nyquist * 0.99:
+                    harmonic_freqs.append(freq)
+                    freq += self.config.gain_noise_base_freq
+                
+                logging.debug(f"Applying gain noise filters at frequencies: {harmonic_freqs}")
+                
+                # Apply notch filter for each harmonic frequency
+                for harmonic_freq in harmonic_freqs:
+                    freq_norm = harmonic_freq / nyquist
+                    if freq_norm < 0.99:  # Ensure we don't exceed Nyquist frequency
+                        b, a = signal.iirnotch(freq_norm, self.config.gain_noise_q)
+                        audio_float = signal.filtfilt(b, a, audio_float)
+                        logging.debug(f"Applied notch filter at {harmonic_freq}Hz")
+            
+            # Convert back to original dtype
+            if audio_data.dtype == np.int16:
+                scaled_audio = audio_float * 32768.0
+                scaled_audio = np.clip(scaled_audio, -32768, 32767)
+                return scaled_audio.astype(np.int16)
+            elif audio_data.dtype == np.int32:
+                scaled_audio = audio_float * 2147483647.0
+                scaled_audio = np.clip(scaled_audio, -2147483648, 2147483647)
+                return scaled_audio.astype(np.int32)
+            else:
+                return audio_float.astype(audio_data.dtype)
+                
+        except Exception as e:
+            logging.warning(f"Audio filtering failed: {e}, returning original audio")
+            return audio_data
     
     def _resample_audio(self, audio_data: np.ndarray, original_sr: int, target_sr: int) -> np.ndarray:
         """Resample audio data to target sample rate"""
@@ -613,6 +702,11 @@ class ContinuousRecorder:
                 channel_audio = np.array(channel_data, dtype=self.config.dtype)
                 logging.debug(f"Channel {ch_idx}: converted to numpy array with shape {channel_audio.shape}")
                 
+                # Apply noise filtering first to remove gain whine
+                if self.config.enable_noise_filtering:
+                    channel_audio = self._filter_audio(channel_audio, self.config.native_sample_rate)
+                    logging.debug(f"Channel {ch_idx}: applied noise filtering")
+                
                 # Apply channel-specific amplification if enabled
                 if self.config.enable_amplification:
                     channel_audio = self._amplify_audio(channel_audio, ch_idx)
@@ -710,6 +804,21 @@ class ContinuousRecorder:
         print(f"💾 Save individual: {self.config.save_individual}")
         print(f"🎛️  Channel names: {self.channel_names}")
         print(f"🔧 Channel gains: {self.channel_gains}")
+        if self.config.enable_noise_filtering:
+            print(f"🔇 Noise filtering: HP={self.config.high_pass_freq}Hz, LP={self.config.low_pass_freq}Hz, Notch={self.config.notch_freq}Hz")
+        else:
+            print("🔇 Noise filtering: Disabled")
+        
+        if self.config.enable_gain_noise_filtering:
+            # Calculate harmonic frequencies for display
+            harmonic_freqs = []
+            freq = self.config.gain_noise_base_freq
+            while freq <= self.config.gain_noise_max_freq:
+                harmonic_freqs.append(freq)
+                freq += self.config.gain_noise_base_freq
+            print(f"🔇 Gain noise filtering: {self.config.gain_noise_base_freq}Hz harmonics up to {self.config.gain_noise_max_freq}Hz: {harmonic_freqs}")
+        else:
+            print("🔇 Gain noise filtering: Disabled")
         print("Press Ctrl+C to stop recording")
         print("=" * 60)
         
@@ -810,6 +919,22 @@ def main():
                        help="Channel indices to apply gain to (0-indexed, default: 2 3 for channels 3 and 4)")
     parser.add_argument("--audio-format", choices=["int16", "int32", "float32"], default="int16",
                        help="Audio format: int16 (best compatibility), int32 (S32_LE), float32 (highest quality)")
+    parser.add_argument("--no-noise-filter", action="store_true",
+                       help="Disable noise filtering (gain whine removal)")
+    parser.add_argument("--high-pass", type=float, default=200.0,
+                       help="High-pass filter frequency in Hz (default: 200)")
+    parser.add_argument("--low-pass", type=float, default=8000.0,
+                       help="Low-pass filter frequency in Hz (default: 8000)")
+    parser.add_argument("--notch-freq", type=float, default=60.0,
+                       help="Notch filter frequency for power line hum in Hz (default: 60)")
+    parser.add_argument("--no-gain-noise-filter", action="store_true",
+                       help="Disable 500Hz gain noise filtering")
+    parser.add_argument("--gain-noise-base-freq", type=float, default=500.0,
+                       help="Base gain noise frequency in Hz (default: 500)")
+    parser.add_argument("--gain-noise-max-freq", type=float, default=6000.0,
+                       help="Maximum frequency to filter gain noise harmonics up to in Hz (default: 6000)")
+    parser.add_argument("--gain-noise-q", type=float, default=30.0,
+                       help="Q factor for gain noise notch filters (default: 30)")
     
     args = parser.parse_args()
     
@@ -830,7 +955,15 @@ def main():
         save_combined=args.save_combined,
         save_individual=args.save_individual,
         channel_names=args.channel_names,
-        apply_gain_to_channels=args.apply_gain_to
+        apply_gain_to_channels=args.apply_gain_to,
+        enable_noise_filtering=not args.no_noise_filter,
+        high_pass_freq=args.high_pass,
+        low_pass_freq=args.low_pass,
+        notch_freq=args.notch_freq,
+        enable_gain_noise_filtering=not args.no_gain_noise_filter,
+        gain_noise_base_freq=args.gain_noise_base_freq,
+        gain_noise_max_freq=args.gain_noise_max_freq,
+        gain_noise_q=args.gain_noise_q
     )
     
     # Override format if specified (this will override device detection)

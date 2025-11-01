@@ -1,0 +1,25 @@
+# Parenting AI SMS System Requirements
+# Core web framework
+flask>=2.3.0
+requests>=2.31.0
+pyyaml>=6.0
+twilio>=8.0.0
+
+# RAG and embeddings
+llama-index>=0.9.0
+llama-index-embeddings-huggingface>=0.1.0
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+
+# System monitoring
+psutil>=5.9.0
+
+# Additional dependencies for llama-index
+pydantic>=2.0.0
+numpy>=1.21.0
+torch>=1.9.0
+transformers>=4.20.0
+Pillow>=10.0.0  # Required for newer transformers versions
+
+# Optional: for better performance on GPU systems
+# faiss-gpu>=1.7.4  # Uncomment if you have GPU support

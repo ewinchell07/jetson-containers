@@ -9,6 +9,7 @@ and view recent activity.
 import json
 import sys
 import argparse
+import subprocess
 from pathlib import Path
 from datetime import datetime, timedelta
 from automation_manager import AutomationManager, AutomationConfig, load_config
@@ -24,6 +25,29 @@ def format_duration(seconds):
         hours = int(seconds // 3600)
         minutes = int((seconds % 3600) // 60)
         return f"{hours}h {minutes}m"
+
+
+def check_container_status(container_name):
+    """Check Docker container status"""
+    try:
+        # Check if container is running
+        cmd = ["docker", "ps", "-q", "--filter", f"name={container_name}"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.stdout.strip():
+            return "🟢 Running"
+        
+        # Check if container exists but is stopped
+        cmd = ["docker", "ps", "-a", "-q", "--filter", f"name={container_name}"]
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        
+        if result.stdout.strip():
+            return "🟡 Stopped"
+        else:
+            return "🔴 Not Found"
+            
+    except Exception as e:
+        return f"❌ Error: {e}"
 
 
 def show_status(config_file=None):
@@ -42,6 +66,10 @@ def show_status(config_file=None):
     
     print(f"Manager: {running_status}")
     print(f"Recording: {recording_status}")
+    
+    # Container status
+    container_status = check_container_status(config.container_name)
+    print(f"Container: {container_status}")
     print()
     
     # Health status

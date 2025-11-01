@@ -16,8 +16,8 @@ from pathlib import Path
 import time
 from datetime import datetime
 
-from transcriber import Transcriber, TranscriptionResult, TranscriptionConfig
-from config import get_transcribe_model, get_allow_swap
+from transcriber import Transcriber, TranscriptionResult, TranscriptionConfig, validate_transcription_language
+from config import get_transcribe_model, get_allow_swap, get_transcribe_prompt
 
 
 @dataclass
@@ -61,9 +61,9 @@ class AdaptiveTranscriber:
         enable_large_models = os.getenv('ENABLE_LARGE_MODELS', 'false').lower() == 'true'
         
         self.model_tiers = [
-            ModelTier('fast', ['tiny', 'base'], 'Fast but less accurate'),
-            ModelTier('balanced', ['small', 'small.en'], 'Good balance of speed and accuracy'),
-            ModelTier('accurate', ['medium', 'medium.en'], 'More accurate, slower')
+            ModelTier('fast', ['tiny.en', 'base.en'], 'Fast but less accurate (English-only)'),
+            ModelTier('balanced', ['small.en'], 'Good balance of speed and accuracy (English-only)'),
+            ModelTier('accurate', ['medium.en'], 'More accurate, slower (English-only)')
         ]
         
         if enable_large_models:
@@ -85,8 +85,9 @@ class AdaptiveTranscriber:
         
         if not self.enabled:
             # Fall back to standard transcription
-            transcriber = Transcriber(initial_model or get_transcribe_model())
-            config = TranscriptionConfig()
+            transcriber = Transcriber(initial_model or get_transcribe_model(), use_adaptive_quality=False)
+            base_prompt = get_transcribe_prompt(audio_file)
+            config = TranscriptionConfig(initial_prompt=base_prompt)
             result = transcriber.model_manager.transcribe_audio(audio_file, config)
             return TranscriptionResult(
                 text=result.get('text', ''),
@@ -111,9 +112,10 @@ class AdaptiveTranscriber:
         
         while retry_count <= self.max_retries:
             try:
-                # Transcribe with current model
-                transcriber = Transcriber(current_model)
-                config = TranscriptionConfig()
+                # Transcribe with current model (disable adaptive quality to prevent infinite recursion)
+                transcriber = Transcriber(current_model, use_adaptive_quality=False)
+                base_prompt = get_transcribe_prompt(audio_file)
+                config = TranscriptionConfig(initial_prompt=base_prompt)
                 result = transcriber.model_manager.transcribe_audio(audio_file, config)
                 results.append((current_model, result))
                 
@@ -129,6 +131,31 @@ class AdaptiveTranscriber:
                     timestamp=datetime.now().isoformat(),
                     audio_file=audio_file
                 )
+                
+                # Validate language before quality assessment
+                logging.info("🔍 Validating transcription language...")
+                validation_result = validate_transcription_language({
+                    'text': transcription_result.text,
+                    'segments': transcription_result.segments
+                })
+                
+                if not validation_result["is_valid"]:
+                    logging.warning(f"⚠️  Language validation failed: {validation_result['reason']}")
+                    logging.warning(f"   Recommendation: {validation_result['recommendation']}")
+                    # Continue to next model if language validation fails
+                    if retry_count < self.max_retries:
+                        next_model = self._select_next_model(current_model, 1.0)  # Assume worst quality
+                        if next_model:
+                            current_model = next_model
+                            retry_count += 1
+                            continue
+                    else:
+                        # Return rejected result if all retries exhausted
+                        transcription_result.text = "[REJECTED - Language validation failed]"
+                        transcription_result.segments = []
+                        return transcription_result
+                else:
+                    logging.info(f"✅ Language validation passed: {validation_result['reason']}")
                 
                 # Assess quality
                 quality_score = self._assess_quality(transcription_result)
